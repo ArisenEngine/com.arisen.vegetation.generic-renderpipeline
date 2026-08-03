@@ -1,0 +1,27 @@
+{
+  "$schema": "https://arisen.dev/schemas/package-v2.json",
+  "id": "com.arisen.vegetation.generic-renderpipeline",
+  "name": "Arisen Vegetation Generic RP",
+  "version": "1.0.0",
+  "engine": {
+    "minVersion": "0.1.0"
+  },
+  "layer": "domain",
+  "author": "Arisen Team",
+  "description": "Generic Render Pipeline adapter for the Arisen vegetation runtime.",
+  "services": {
+    "provides": [],
+    "requires": [
+      "ArisenEngine.Rendering.IGenericRenderPipelineFeatureRegistry",
+      "ArisenEngine.Vegetation.IVegetationClusterDataSource",
+      "ArisenEngine.Vegetation.IVegetationDiagnosticsPublisher",
+      "ArisenEngine.Vegetation.IVegetationAuthoringPreviewService"
+    ]
+  },
+  "dependencies": {
+    "com.arisen.core": "1.0.0",
+    "com.arisen.vegetation": "1.0.0",
+    "com.arisen.rendering": "1.0.0",
+    "com.arisen.generic-renderpipeline": "1.0.0"
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "entry": {
+    "assembly": "Com.Arisen.Vegetation.GenericRenderpipeline.dll",
+    "class": "ArisenEngine.Vegetation.GenericRenderPipeline.VegetationGenericRenderPipelinePackage"
+  }
+}
