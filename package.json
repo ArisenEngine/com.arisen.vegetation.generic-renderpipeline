@@ -12,14 +12,20 @@
   "services": {
     "provides": [],
     "requires": [
+      "ArisenEngine.Core.Assets.IAssetDatabase",
+      "ArisenEngine.Threading.IBackgroundTaskScheduler",
       "ArisenEngine.Rendering.IGenericRenderPipelineFeatureRegistry",
+      "ArisenEngine.Resources.Serialization.IRuntimeAssetResidencyService",
       "ArisenEngine.Vegetation.IVegetationClusterDataSource",
+      "ArisenEngine.Vegetation.IVegetationRuntimeDataStore",
       "ArisenEngine.Vegetation.IVegetationDiagnosticsPublisher",
       "ArisenEngine.Vegetation.IVegetationAuthoringPreviewService"
     ]
   },
   "dependencies": {
     "com.arisen.core": "1.0.0",
+    "com.arisen.taskgraph": "1.0.0",
+    "com.arisen.resources": "1.0.0",
     "com.arisen.vegetation": "1.0.0",
     "com.arisen.rendering": "1.0.0",
     "com.arisen.generic-renderpipeline": "1.0.0"
