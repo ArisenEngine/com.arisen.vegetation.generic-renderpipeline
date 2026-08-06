@@ -4,16 +4,19 @@ using ArisenEngine.Resources.Serialization;
 using ArisenEngine.Threading;
 using ArisenKernel.Packages;
 using ArisenKernel.Services;
+using ArisenKernel.Diagnostics;
 
 namespace ArisenEngine.Vegetation.GenericRenderPipeline;
 
 public sealed class VegetationGenericRenderPipelinePackage : IPackageEntry
 {
     private IGenericRenderPipelineFeatureRegistry? m_FeatureRegistry;
+    private IGenericRenderPipelineRuntimeShaderRegistry? m_ShaderRegistry;
     private IRuntimeAssetResidencyService? m_ResidencyService;
     private VegetationPreparedAssetProvider? m_PreparedAssets;
     private VegetationGenericRenderPipelineFeature? m_Feature;
     private bool m_FeatureRegistered;
+    private bool m_ShaderRegistered;
     private bool m_FeatureResourcesReleased;
     private bool m_PreparedProviderRegistered;
     private bool m_PreparedAssetsDisposed;
@@ -22,6 +25,7 @@ public sealed class VegetationGenericRenderPipelinePackage : IPackageEntry
         m_Feature != null ||
         m_PreparedAssets != null ||
         m_FeatureRegistered ||
+        m_ShaderRegistered ||
         m_PreparedProviderRegistered;
 
     public void OnLoad(IServiceRegistry services)
@@ -33,29 +37,76 @@ public sealed class VegetationGenericRenderPipelinePackage : IPackageEntry
         }
 
         m_FeatureRegistry = services.GetService<IGenericRenderPipelineFeatureRegistry>();
+        m_ShaderRegistry =
+            services.GetService<IGenericRenderPipelineRuntimeShaderRegistry>();
         m_ResidencyService = services.GetService<IRuntimeAssetResidencyService>();
         m_FeatureRegistered = false;
+        m_ShaderRegistered = false;
         m_FeatureResourcesReleased = false;
         m_PreparedProviderRegistered = false;
         m_PreparedAssetsDisposed = false;
 
         try
         {
+            IAssetDatabase assetDatabase = services.GetService<IAssetDatabase>();
+            VegetationRenderValidationMode validationMode =
+                VegetationRenderValidationPolicy.ResolveFromEnvironment();
+            if (validationMode != VegetationRenderValidationMode.Full)
+            {
+                KernelLog.InfoFormat(
+                    "[Vegetation.GenericRP.VisualValidation] Mode={0}",
+                    validationMode);
+            }
+            var gpuResources = new VegetationGpuResourceFactory(
+                services.GetService<IGenericRenderPipelinePreparedAssetSource>());
             m_PreparedAssets = new VegetationPreparedAssetProvider(
-                services.GetService<IAssetDatabase>(),
+                assetDatabase,
                 services.GetService<IBackgroundTaskScheduler>(),
                 services.GetService<IVegetationRuntimeDataStore>(),
-                m_ResidencyService);
+                m_ResidencyService,
+                gpuResources);
             m_Feature = new VegetationGenericRenderPipelineFeature(
+                services.GetService<IVegetationClusterRenderSource>(),
                 services.GetService<IVegetationClusterDataSource>(),
                 services.GetService<IVegetationDiagnosticsPublisher>(),
-                services.GetService<IVegetationAuthoringPreviewService>());
+                services.GetService<IVegetationAuthoringPreviewService>(),
+                m_PreparedAssets,
+                new VegetationOpaquePass(assetDatabase),
+                new VegetationShadowPass(assetDatabase),
+                validationMode);
 
-            m_FeatureRegistered = true;
-            m_FeatureRegistry.Register(m_Feature);
+            m_ShaderRegistry.RegisterRuntimeShaders(
+                VegetationGenericRenderPipelineFeature.Id,
+                VegetationGenericRenderPipelineShaderAssets.CreateRuntimeShaders());
+            m_ShaderRegistered = true;
 
-            m_PreparedProviderRegistered = true;
-            m_ResidencyService.RegisterPreparedProvider(m_PreparedAssets);
+            try
+            {
+                m_FeatureRegistry.Register(m_Feature);
+                m_FeatureRegistered = true;
+            }
+            catch
+            {
+                m_FeatureRegistered = m_FeatureRegistry.IsRegistered(m_Feature);
+                throw;
+            }
+
+            try
+            {
+                m_ResidencyService.RegisterPreparedProvider(m_PreparedAssets);
+                UpdatePreparedProviderOwnership();
+                if (!m_PreparedProviderRegistered)
+                {
+                    throw new InvalidOperationException(
+                        "Vegetation prepared-provider registration returned without " +
+                        "registering the package-owned instance.");
+                }
+            }
+            catch
+            {
+                UpdatePreparedProviderOwnership();
+                throw;
+            }
         }
         catch (Exception loadError)
         {
@@ -119,12 +170,7 @@ public sealed class VegetationGenericRenderPipelinePackage : IPackageEntry
         {
             try
             {
-                if (m_ResidencyService.IsPreparedProviderRegistered(m_PreparedAssets))
-                {
-                    m_ResidencyService.UnregisterPreparedProvider(m_PreparedAssets.ProviderId);
-                }
-
-                m_PreparedProviderRegistered = false;
+                UnregisterOwnedPreparedProvider();
             }
             catch (Exception ex)
             {
@@ -153,14 +199,18 @@ public sealed class VegetationGenericRenderPipelinePackage : IPackageEntry
         {
             AttemptCleanup(
                 "prepared-provider unregister after disposal",
-                () =>
-                {
-                    if (m_ResidencyService.IsPreparedProviderRegistered(m_PreparedAssets))
-                    {
-                        m_ResidencyService.UnregisterPreparedProvider(m_PreparedAssets.ProviderId);
-                    }
-                },
-                () => m_PreparedProviderRegistered = false,
+                UnregisterOwnedPreparedProvider,
+                static () => { },
+                failures);
+        }
+
+        if (m_ShaderRegistered && m_ShaderRegistry != null)
+        {
+            AttemptCleanup(
+                "runtime-shader unregister",
+                () => m_ShaderRegistry.UnregisterRuntimeShaders(
+                    VegetationGenericRenderPipelineFeature.Id),
+                () => m_ShaderRegistered = false,
                 failures);
         }
 
@@ -179,6 +229,11 @@ public sealed class VegetationGenericRenderPipelinePackage : IPackageEntry
         if (m_Feature == null)
         {
             m_FeatureRegistry = null;
+        }
+
+        if (!m_ShaderRegistered)
+        {
+            m_ShaderRegistry = null;
         }
 
         if (m_PreparedAssets == null)
@@ -204,5 +259,46 @@ public sealed class VegetationGenericRenderPipelinePackage : IPackageEntry
                 $"Vegetation GenericRP failed to complete {stage}.",
                 ex));
         }
+    }
+
+    private void UnregisterOwnedPreparedProvider()
+    {
+        if (m_ResidencyService == null || m_PreparedAssets == null)
+        {
+            m_PreparedProviderRegistered = false;
+            return;
+        }
+
+        UpdatePreparedProviderOwnership();
+        if (!m_PreparedProviderRegistered)
+        {
+            return;
+        }
+
+        try
+        {
+            m_ResidencyService.UnregisterPreparedProvider(m_PreparedAssets.ProviderId);
+        }
+        finally
+        {
+            UpdatePreparedProviderOwnership();
+        }
+
+        if (m_PreparedProviderRegistered)
+        {
+            throw new InvalidOperationException(
+                "Vegetation prepared-provider unregister returned while the package-owned " +
+                "instance remained registered.");
+        }
+    }
+
+    private void UpdatePreparedProviderOwnership()
+    {
+        bool ownsRegistration =
+            m_ResidencyService != null &&
+            m_PreparedAssets != null &&
+            m_ResidencyService.IsPreparedProviderRegistered(m_PreparedAssets);
+        m_PreparedProviderRegistered = ownsRegistration;
+        m_PreparedAssets?.SetResidencyRegistrationOwned(ownsRegistration);
     }
 }
