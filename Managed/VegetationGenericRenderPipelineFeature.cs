@@ -286,7 +286,7 @@ internal sealed class VegetationGenericRenderPipelineFeature : IGenericRenderPip
         {
             ref readonly VegetationClusterComponent component =
                 ref m_ExtractedClusters[componentIndex];
-            if (!TryFindResidentCluster(
+            if (!VegetationClusterLookup.TryFindResidentCluster(
                     residentClusters,
                     component.ClusterGuid,
                     out VegetationResidentClusterData resident) ||
@@ -324,7 +324,11 @@ internal sealed class VegetationGenericRenderPipelineFeature : IGenericRenderPip
         {
             ref readonly VegetationClusterCullingInput input = ref m_CullingInputs[inputIndex];
             VegetationClusterComponent component = input.Component;
-            if (!TryFindSelection(
+            if (!VegetationClusterLookup.TryFindSelection(
+                    new ReadOnlySpan<VegetationCullingSelection>(
+                        m_CullingSelections,
+                        0,
+                        m_CullingSelectionCount),
                     input.Resident.Guid,
                     out VegetationCullingSelection selection) ||
                 !selection.Accepted)
@@ -446,25 +450,6 @@ internal sealed class VegetationGenericRenderPipelineFeature : IGenericRenderPip
             m_ShadowDrawRanges);
     }
 
-    private static bool TryFindResidentCluster(
-        ReadOnlySpan<VegetationResidentClusterData> clusters,
-        Guid clusterGuid,
-        out VegetationResidentClusterData cluster)
-    {
-        for (int index = 0; index < clusters.Length; index++)
-        {
-            VegetationResidentClusterData candidate = clusters[index];
-            if (candidate.Guid == clusterGuid)
-            {
-                cluster = candidate;
-                return true;
-            }
-        }
-
-        cluster = null!;
-        return false;
-    }
-
     private static bool MatchesComponent(
         in VegetationClusterComponent component,
         VegetationResidentClusterData resident) =>
@@ -476,24 +461,6 @@ internal sealed class VegetationGenericRenderPipelineFeature : IGenericRenderPip
             component.OriginZ) &&
         resident.PageCount == component.PageCount &&
         resident.InstanceCount == component.InstanceCount;
-
-    private bool TryFindSelection(
-        Guid clusterGuid,
-        out VegetationCullingSelection selection)
-    {
-        for (int index = 0; index < m_CullingSelectionCount; index++)
-        {
-            VegetationCullingSelection candidate = m_CullingSelections[index];
-            if (candidate.ClusterGuid == clusterGuid)
-            {
-                selection = candidate;
-                return true;
-            }
-        }
-
-        selection = default;
-        return false;
-    }
 
     private static VegetationCullingView CreateCullingView(
         in GenericRenderPipelineFeatureFrameContext context)
