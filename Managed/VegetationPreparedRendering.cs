@@ -155,6 +155,45 @@ internal readonly struct VegetationPreparedBatch
         uint instanceCount,
         VegetationShadowPolicy shadowPolicy,
         in VegetationPreparedMaterialData material)
+        : this(
+            speciesGuid,
+            meshGuid,
+            materialGuid,
+            vertexBuffer,
+            indexBuffer,
+            indexType,
+            indexCount,
+            firstIndex,
+            vertexOffset,
+            instanceBufferIndex,
+            firstInstance,
+            instanceCount,
+            lodLevel: 0,
+            maximumDistance: float.MaxValue,
+            maximumScreenError: float.MaxValue,
+            shadowPolicy,
+            material)
+    {
+    }
+
+    public VegetationPreparedBatch(
+        Guid speciesGuid,
+        Guid meshGuid,
+        Guid materialGuid,
+        RHIBufferHandle vertexBuffer,
+        RHIBufferHandle indexBuffer,
+        EIndexType indexType,
+        uint indexCount,
+        uint firstIndex,
+        int vertexOffset,
+        uint instanceBufferIndex,
+        uint firstInstance,
+        uint instanceCount,
+        int lodLevel,
+        float maximumDistance,
+        float maximumScreenError,
+        VegetationShadowPolicy shadowPolicy,
+        in VegetationPreparedMaterialData material)
     {
         SpeciesGuid = speciesGuid;
         MeshGuid = meshGuid;
@@ -168,6 +207,9 @@ internal readonly struct VegetationPreparedBatch
         InstanceBufferIndex = instanceBufferIndex;
         FirstInstance = firstInstance;
         InstanceCount = instanceCount;
+        LodLevel = lodLevel;
+        MaximumDistance = maximumDistance;
+        MaximumScreenError = maximumScreenError;
         ShadowPolicy = shadowPolicy;
         Material = material;
     }
@@ -184,12 +226,20 @@ internal readonly struct VegetationPreparedBatch
     public uint InstanceBufferIndex { get; }
     public uint FirstInstance { get; }
     public uint InstanceCount { get; }
+    public int LodLevel { get; }
+    public float MaximumDistance { get; }
+    public float MaximumScreenError { get; }
     public VegetationShadowPolicy ShadowPolicy { get; }
     public VegetationPreparedMaterialData Material { get; }
     public bool IsValid =>
         VertexBuffer.IsValid &&
         IndexBuffer.IsValid &&
         IndexCount > 0 &&
+        LodLevel >= 0 &&
+        float.IsFinite(MaximumDistance) &&
+        MaximumDistance >= 0.0f &&
+        float.IsFinite(MaximumScreenError) &&
+        MaximumScreenError >= 0.0f &&
         InstanceBufferIndex != uint.MaxValue &&
         InstanceCount > 0;
 }
@@ -197,6 +247,7 @@ internal readonly struct VegetationPreparedBatch
 internal readonly struct VegetationPreparedClusterView
 {
     private readonly VegetationPreparedBatch[]? m_Batches;
+    private readonly CookedVegetationSpecies[]? m_Species;
 
     public VegetationPreparedClusterView(
         Guid clusterGuid,
@@ -204,19 +255,42 @@ internal readonly struct VegetationPreparedClusterView
         WorldPosition origin,
         VegetationPreparedBatch[] batches,
         int instanceCount)
+        : this(
+            clusterGuid,
+            generation,
+            origin,
+            batches,
+            instanceCount,
+            acceleration: null,
+            species: null)
+    {
+    }
+
+    public VegetationPreparedClusterView(
+        Guid clusterGuid,
+        ulong generation,
+        WorldPosition origin,
+        VegetationPreparedBatch[] batches,
+        int instanceCount,
+        CookedVegetationClusterAcceleration? acceleration,
+        CookedVegetationSpecies[]? species)
     {
         ClusterGuid = clusterGuid;
         Generation = generation;
         Origin = origin;
         m_Batches = batches ?? throw new ArgumentNullException(nameof(batches));
+        m_Species = species;
         InstanceCount = instanceCount;
+        Acceleration = acceleration;
     }
 
     public Guid ClusterGuid { get; }
     public ulong Generation { get; }
     public WorldPosition Origin { get; }
     public int InstanceCount { get; }
+    public CookedVegetationClusterAcceleration? Acceleration { get; }
     public ReadOnlySpan<VegetationPreparedBatch> Batches => m_Batches;
+    public ReadOnlySpan<CookedVegetationSpecies> Species => m_Species;
     public bool IsValid =>
         ClusterGuid != Guid.Empty &&
         Generation != 0 &&

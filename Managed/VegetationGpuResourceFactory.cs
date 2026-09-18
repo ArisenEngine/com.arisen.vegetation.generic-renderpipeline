@@ -155,6 +155,8 @@ internal sealed class VegetationGpuResourceFactory : IVegetationClusterGpuResour
                     pages[0].Origin,
                     instances.Length,
                     batches,
+                    cluster.Acceleration,
+                    species.ToArray(),
                     instanceBuffer,
                     dependencyLeases);
                 instanceBuffer = null;
@@ -325,63 +327,66 @@ internal sealed class VegetationGpuResourceFactory : IVegetationClusterGpuResour
             for (int speciesIndex = 0; speciesIndex < species.Count; speciesIndex++)
             {
                 CookedVegetationSpecies item = species[speciesIndex];
-                CookedVegetationSpeciesLod lod = item.Lods[0];
-                RuntimeAssetResidencyKey meshKey = CreateMeshKey(lod.Mesh);
-                if (!meshLeases.ContainsKey(meshKey))
+                for (int lodIndex = 0; lodIndex < item.Lods.Count; lodIndex++)
                 {
-                    if (!m_PreparedAssets.TryAcquirePreparedMesh(
-                            meshKey,
-                            out IGenericRenderPipelinePreparedMeshLease meshLease))
+                    CookedVegetationSpeciesLod lod = item.Lods[lodIndex];
+                    RuntimeAssetResidencyKey meshKey = CreateMeshKey(lod.Mesh);
+                    if (!meshLeases.ContainsKey(meshKey))
                     {
-                        dependencies = null!;
-                        diagnostic =
-                            $"Vegetation species '{item.PackageId}:{item.Guid:D}' is waiting " +
-                            $"for prepared mesh '{meshKey}'.";
-                        return false;
+                        if (!m_PreparedAssets.TryAcquirePreparedMesh(
+                                meshKey,
+                                out IGenericRenderPipelinePreparedMeshLease meshLease))
+                        {
+                            dependencies = null!;
+                            diagnostic =
+                                $"Vegetation species '{item.PackageId}:{item.Guid:D}' is waiting " +
+                                $"for prepared mesh '{meshKey}'.";
+                            return false;
+                        }
+
+                        acquired.Add(meshLease);
+                        if (meshLease.Key != meshKey ||
+                            meshLease.DeviceGeneration != m_DeviceGeneration ||
+                            !meshLease.IsCurrent ||
+                            !meshLease.Resource.IsValid)
+                        {
+                            dependencies = null!;
+                            diagnostic =
+                                $"Vegetation species '{item.PackageId}:{item.Guid:D}' acquired " +
+                                $"a stale or mismatched mesh publication for '{meshKey}'.";
+                            return false;
+                        }
+                        meshLeases.Add(meshKey, meshLease);
                     }
 
-                    acquired.Add(meshLease);
-                    if (meshLease.Key != meshKey ||
-                        meshLease.DeviceGeneration != m_DeviceGeneration ||
-                        !meshLease.IsCurrent ||
-                        !meshLease.Resource.IsValid)
+                    RuntimeAssetResidencyKey materialKey = CreateMaterialKey(lod.Material);
+                    if (!materialLeases.ContainsKey(materialKey))
                     {
-                        dependencies = null!;
-                        diagnostic =
-                            $"Vegetation species '{item.PackageId}:{item.Guid:D}' acquired " +
-                            $"a stale or mismatched mesh publication for '{meshKey}'.";
-                        return false;
-                    }
-                    meshLeases.Add(meshKey, meshLease);
-                }
+                        if (!m_PreparedAssets.TryAcquirePreparedMaterial(
+                                materialKey,
+                                out IGenericRenderPipelinePreparedMaterialLease materialLease))
+                        {
+                            dependencies = null!;
+                            diagnostic =
+                                $"Vegetation species '{item.PackageId}:{item.Guid:D}' is waiting " +
+                                $"for prepared material '{materialKey}'.";
+                            return false;
+                        }
 
-                RuntimeAssetResidencyKey materialKey = CreateMaterialKey(lod.Material);
-                if (!materialLeases.ContainsKey(materialKey))
-                {
-                    if (!m_PreparedAssets.TryAcquirePreparedMaterial(
-                            materialKey,
-                            out IGenericRenderPipelinePreparedMaterialLease materialLease))
-                    {
-                        dependencies = null!;
-                        diagnostic =
-                            $"Vegetation species '{item.PackageId}:{item.Guid:D}' is waiting " +
-                            $"for prepared material '{materialKey}'.";
-                        return false;
+                        acquired.Add(materialLease);
+                        if (materialLease.Key != materialKey ||
+                            materialLease.DeviceGeneration != m_DeviceGeneration ||
+                            !materialLease.IsCurrent ||
+                            !materialLease.Resource.IsValid)
+                        {
+                            dependencies = null!;
+                            diagnostic =
+                                $"Vegetation species '{item.PackageId}:{item.Guid:D}' acquired " +
+                                $"a stale or mismatched material publication for '{materialKey}'.";
+                            return false;
+                        }
+                        materialLeases.Add(materialKey, materialLease);
                     }
-
-                    acquired.Add(materialLease);
-                    if (materialLease.Key != materialKey ||
-                        materialLease.DeviceGeneration != m_DeviceGeneration ||
-                        !materialLease.IsCurrent ||
-                        !materialLease.Resource.IsValid)
-                    {
-                        dependencies = null!;
-                        diagnostic =
-                            $"Vegetation species '{item.PackageId}:{item.Guid:D}' acquired " +
-                            $"a stale or mismatched material publication for '{materialKey}'.";
-                        return false;
-                    }
-                    materialLeases.Add(materialKey, materialLease);
                 }
             }
 
@@ -505,61 +510,67 @@ internal sealed class VegetationGpuResourceFactory : IVegetationClusterGpuResour
                 groupEnd++;
             }
 
-            CookedVegetationSpeciesLod lod = first.Species.Lods[0];
-            RuntimeAssetResidencyKey meshKey = CreateMeshKey(lod.Mesh);
-            if (!dependencyLeases.TryGetMesh(
-                    meshKey,
-                    out IGenericRenderPipelinePreparedMeshLease meshLease) ||
-                !meshLease.IsCurrent ||
-                !meshLease.Resource.IsValid)
+            for (int lodIndex = 0; lodIndex < first.Species.Lods.Count; lodIndex++)
             {
-                batches = Array.Empty<PendingBatch>();
-                diagnostic =
-                    $"Vegetation species '{first.Species.Guid:D}' is waiting for prepared mesh " +
-                    $"'{meshKey}'.";
-                return false;
-            }
-            RHIStaticMeshResource mesh = meshLease.Resource;
-            if (mesh.VertexStride != MeshAssetCooker.StaticMeshVertexStride)
-            {
-                throw new NotSupportedException(
-                    $"Vegetation mesh '{lod.Mesh.Guid:D}' uses unsupported vertex stride " +
-                    $"{mesh.VertexStride}; expected {MeshAssetCooker.StaticMeshVertexStride}.");
-            }
-            RuntimeAssetResidencyKey materialKey = CreateMaterialKey(lod.Material);
-            if (!dependencyLeases.TryGetMaterial(
-                    materialKey,
-                    out IGenericRenderPipelinePreparedMaterialLease materialLease) ||
-                !materialLease.IsCurrent ||
-                !materialLease.Resource.IsValid)
-            {
-                batches = Array.Empty<PendingBatch>();
-                diagnostic =
-                    $"Vegetation species '{first.Species.Guid:D}' is waiting for prepared " +
-                    $"material '{materialKey}'.";
-                return false;
-            }
-            RHIMaterialResource material = materialLease.Resource;
+                CookedVegetationSpeciesLod lod = first.Species.Lods[lodIndex];
+                RuntimeAssetResidencyKey meshKey = CreateMeshKey(lod.Mesh);
+                if (!dependencyLeases.TryGetMesh(
+                        meshKey,
+                        out IGenericRenderPipelinePreparedMeshLease meshLease) ||
+                    !meshLease.IsCurrent ||
+                    !meshLease.Resource.IsValid)
+                {
+                    batches = Array.Empty<PendingBatch>();
+                    diagnostic =
+                        $"Vegetation species '{first.Species.Guid:D}' is waiting for prepared mesh " +
+                        $"'{meshKey}'.";
+                    return false;
+                }
+                RHIStaticMeshResource mesh = meshLease.Resource;
+                if (mesh.VertexStride != MeshAssetCooker.StaticMeshVertexStride)
+                {
+                    throw new NotSupportedException(
+                        $"Vegetation mesh '{lod.Mesh.Guid:D}' uses unsupported vertex stride " +
+                        $"{mesh.VertexStride}; expected {MeshAssetCooker.StaticMeshVertexStride}.");
+                }
+                RuntimeAssetResidencyKey materialKey = CreateMaterialKey(lod.Material);
+                if (!dependencyLeases.TryGetMaterial(
+                        materialKey,
+                        out IGenericRenderPipelinePreparedMaterialLease materialLease) ||
+                    !materialLease.IsCurrent ||
+                    !materialLease.Resource.IsValid)
+                {
+                    batches = Array.Empty<PendingBatch>();
+                    diagnostic =
+                        $"Vegetation species '{first.Species.Guid:D}' is waiting for prepared " +
+                        $"material '{materialKey}'.";
+                    return false;
+                }
+                RHIMaterialResource material = materialLease.Resource;
 
-            VegetationPreparedMaterialData materialData = PrepareMaterial(material, lod.Material.Guid);
-            ReadOnlySpan<MeshSubmesh> submeshes = mesh.Submeshes;
-            for (int submeshIndex = 0; submeshIndex < submeshes.Length; submeshIndex++)
-            {
-                MeshSubmesh submesh = submeshes[submeshIndex];
-                pending.Add(new PendingBatch(
-                    first.Species.Guid,
-                    lod.Mesh.Guid,
-                    lod.Material.Guid,
-                    mesh.VertexBuffer,
-                    mesh.IndexBuffer,
-                    mesh.IndexType,
-                    submesh.IndexCount,
-                    submesh.FirstIndex,
-                    submesh.VertexOffset,
-                    checked((uint)groupStart),
-                    checked((uint)(groupEnd - groupStart)),
-                    first.Species.ShadowPolicy,
-                    materialData));
+                VegetationPreparedMaterialData materialData = PrepareMaterial(material, lod.Material.Guid);
+                ReadOnlySpan<MeshSubmesh> submeshes = mesh.Submeshes;
+                for (int submeshIndex = 0; submeshIndex < submeshes.Length; submeshIndex++)
+                {
+                    MeshSubmesh submesh = submeshes[submeshIndex];
+                    pending.Add(new PendingBatch(
+                        first.Species.Guid,
+                        lod.Mesh.Guid,
+                        lod.Material.Guid,
+                        mesh.VertexBuffer,
+                        mesh.IndexBuffer,
+                        mesh.IndexType,
+                        submesh.IndexCount,
+                        submesh.FirstIndex,
+                        submesh.VertexOffset,
+                        checked((uint)groupStart),
+                        checked((uint)(groupEnd - groupStart)),
+                        lodIndex,
+                        lod.MaximumDistance,
+                        lod.MaximumScreenError,
+                        first.Species.ShadowPolicy,
+                        materialData));
+                }
             }
 
             groupStart = groupEnd;
@@ -794,6 +805,9 @@ internal sealed class VegetationGpuResourceFactory : IVegetationClusterGpuResour
             int vertexOffset,
             uint firstInstance,
             uint instanceCount,
+            int lodLevel,
+            float maximumDistance,
+            float maximumScreenError,
             VegetationShadowPolicy shadowPolicy,
             in VegetationPreparedMaterialData material)
         {
@@ -808,6 +822,9 @@ internal sealed class VegetationGpuResourceFactory : IVegetationClusterGpuResour
             VertexOffset = vertexOffset;
             FirstInstance = firstInstance;
             InstanceCount = instanceCount;
+            LodLevel = lodLevel;
+            MaximumDistance = maximumDistance;
+            MaximumScreenError = maximumScreenError;
             ShadowPolicy = shadowPolicy;
             Material = material;
         }
@@ -823,6 +840,9 @@ internal sealed class VegetationGpuResourceFactory : IVegetationClusterGpuResour
         public int VertexOffset { get; }
         public uint FirstInstance { get; }
         public uint InstanceCount { get; }
+        public int LodLevel { get; }
+        public float MaximumDistance { get; }
+        public float MaximumScreenError { get; }
         public VegetationShadowPolicy ShadowPolicy { get; }
         public VegetationPreparedMaterialData Material { get; }
 
@@ -839,6 +859,9 @@ internal sealed class VegetationGpuResourceFactory : IVegetationClusterGpuResour
             instanceBufferIndex,
             FirstInstance,
             InstanceCount,
+            LodLevel,
+            MaximumDistance,
+            MaximumScreenError,
             ShadowPolicy,
             Material);
     }
@@ -943,6 +966,8 @@ internal sealed class VegetationGpuResourceFactory : IVegetationClusterGpuResour
         private readonly WorldPosition m_Origin;
         private readonly int m_InstanceCount;
         private readonly VegetationPreparedBatch[] m_Batches;
+        private readonly CookedVegetationClusterAcceleration? m_Acceleration;
+        private readonly CookedVegetationSpecies[]? m_Species;
         private VegetationGpuBuffer? m_InstanceBuffer;
         private PreparedDependencyLeaseSet? m_DependencyLeases;
 
@@ -952,6 +977,8 @@ internal sealed class VegetationGpuResourceFactory : IVegetationClusterGpuResour
             WorldPosition origin,
             int instanceCount,
             VegetationPreparedBatch[] batches,
+            CookedVegetationClusterAcceleration? acceleration,
+            CookedVegetationSpecies[] species,
             VegetationGpuBuffer instanceBuffer,
             PreparedDependencyLeaseSet dependencyLeases)
         {
@@ -960,6 +987,8 @@ internal sealed class VegetationGpuResourceFactory : IVegetationClusterGpuResour
             m_Origin = origin;
             m_InstanceCount = instanceCount;
             m_Batches = batches;
+            m_Acceleration = acceleration;
+            m_Species = species ?? throw new ArgumentNullException(nameof(species));
             m_InstanceBuffer = instanceBuffer;
             m_DependencyLeases = dependencyLeases;
         }
@@ -982,7 +1011,9 @@ internal sealed class VegetationGpuResourceFactory : IVegetationClusterGpuResour
                 generation,
                 m_Origin,
                 m_Batches,
-                m_InstanceCount);
+                m_InstanceCount,
+                m_Acceleration,
+                m_Species);
         }
 
         public void Dispose()
