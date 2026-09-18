@@ -1,4 +1,5 @@
 using ArisenEngine.Resources.Serialization;
+using ArisenEngine.Threading;
 using ArisenEngine.Vegetation;
 using ArisenEngine.Vegetation.Assets;
 using System.Numerics;
@@ -171,14 +172,32 @@ internal sealed class VegetationCullingPlanner
     private VegetationCullingPriority[] m_PriorityStorage = Array.Empty<VegetationCullingPriority>();
     private VegetationCullingHistory[] m_HistoryStorage = Array.Empty<VegetationCullingHistory>();
     private VegetationCullingSelection[] m_Output = Array.Empty<VegetationCullingSelection>();
-    private int[] m_NodeStack = Array.Empty<int>();
-    private bool[] m_VisiblePages = Array.Empty<bool>();
+    private readonly VegetationSetupWorkDispatcher m_CullingDispatcher;
+    private readonly Action<int> m_EvaluateWorkItem;
+    private VegetationCullingShardScratch[] m_Shards =
+        Array.Empty<VegetationCullingShardScratch>();
+    private VegetationClusterCullingInput[] m_PlanInputs =
+        Array.Empty<VegetationClusterCullingInput>();
+    private int m_PlanInputCount;
+    private VegetationCullingView m_PlanView;
+    private VegetationCullingSettings m_PlanSettings;
     private int m_CandidateCount;
     private int m_HistoryCount;
     private int m_OutputCount;
 
+    public VegetationCullingPlanner(ITaskGraph? taskSystem = null)
+    {
+        m_CullingDispatcher = new VegetationSetupWorkDispatcher(taskSystem);
+        m_EvaluateWorkItem = EvaluateClusterRange;
+    }
+
     public VegetationCullingMetrics Metrics { get; private set; }
 
+    /// <summary>
+    /// Evaluates the clusters on disjoint shards and merges the shard outputs in work-item
+    /// order. Shard ranges partition the input sequence, so the merged candidate sequence is
+    /// the serial candidate sequence and the scheduling policy cannot change the selection.
+    /// </summary>
     public ReadOnlySpan<VegetationCullingSelection> Plan(
         ReadOnlySpan<VegetationClusterCullingInput> inputs,
         in VegetationCullingView view,
@@ -203,10 +222,134 @@ internal sealed class VegetationCullingPlanner
             return ReadOnlySpan<VegetationCullingSelection>.Empty;
         }
 
+        if (m_PlanInputs.Length < inputs.Length)
+        {
+            Array.Resize(ref m_PlanInputs, inputs.Length);
+        }
+
+        inputs.CopyTo(m_PlanInputs);
+        m_PlanInputCount = inputs.Length;
+        m_PlanView = view;
+        m_PlanSettings = settings;
+        EnsureShardCapacity(VegetationSetupWorkPartition.GetWorkItemCount(inputs.Length));
+        int workItemCount = m_CullingDispatcher.Dispatch(inputs.Length, m_EvaluateWorkItem);
+
         int culledClusterCount = 0;
         int culledPageCount = 0;
         int culledSpeciesCount = 0;
-        for (int inputIndex = 0; inputIndex < inputs.Length; inputIndex++)
+        int mergedCandidateCount = 0;
+        for (int workItemIndex = 0; workItemIndex < workItemCount; workItemIndex++)
+        {
+            VegetationCullingShardScratch shard = m_Shards[workItemIndex];
+            culledClusterCount = checked(culledClusterCount + shard.CulledClusterCount);
+            culledPageCount = checked(culledPageCount + shard.CulledPageCount);
+            culledSpeciesCount = checked(culledSpeciesCount + shard.CulledSpeciesCount);
+            mergedCandidateCount = checked(mergedCandidateCount + shard.CandidateCount);
+        }
+
+        if (mergedCandidateCount == 0)
+        {
+            m_HistoryCount = 0;
+            Metrics = new VegetationCullingMetrics(
+                inputs.Length,
+                0,
+                0,
+                culledClusterCount,
+                culledPageCount,
+                culledSpeciesCount,
+                0,
+                0,
+                0,
+                0,
+                0);
+            return ReadOnlySpan<VegetationCullingSelection>.Empty;
+        }
+
+        EnsureCandidateCapacity(mergedCandidateCount);
+        int mergeOffset = 0;
+        for (int workItemIndex = 0; workItemIndex < workItemCount; workItemIndex++)
+        {
+            VegetationCullingShardScratch shard = m_Shards[workItemIndex];
+            if (shard.CandidateCount == 0)
+            {
+                continue;
+            }
+
+            new ReadOnlySpan<VegetationCullingCandidate>(
+                shard.Candidates,
+                0,
+                shard.CandidateCount).CopyTo(
+                    new Span<VegetationCullingCandidate>(
+                        m_CandidateStorage,
+                        mergeOffset,
+                        shard.CandidateCount));
+            mergeOffset += shard.CandidateCount;
+        }
+
+        m_CandidateCount = mergeOffset;
+        SortCandidates(m_CandidateStorage, m_CandidateCount);
+        SaveHistory();
+        int visibleSpeciesCount = m_CandidateCount;
+        SelectBudgetedCandidates(settings, out int droppedSpeciesCount);
+        BuildOutput();
+
+        int selectedSpeciesCount = 0;
+        int selectedInstanceCount = 0;
+        int maximumSelectedLod = 0;
+        for (int index = 0; index < m_OutputCount; index++)
+        {
+            ref readonly VegetationCullingSelection selection = ref m_Output[index];
+            if (!selection.Accepted)
+            {
+                continue;
+            }
+
+            selectedSpeciesCount++;
+            selectedInstanceCount = checked(
+                selectedInstanceCount + selection.BudgetInstanceCount);
+            maximumSelectedLod = Math.Max(maximumSelectedLod, selection.LodLevel);
+        }
+
+        Metrics = new VegetationCullingMetrics(
+            inputs.Length,
+            m_CandidateCount,
+            visibleSpeciesCount,
+            culledClusterCount,
+            culledPageCount,
+            culledSpeciesCount,
+            droppedSpeciesCount,
+            selectedSpeciesCount,
+            selectedInstanceCount,
+            selectedSpeciesCount,
+            maximumSelectedLod);
+        return new ReadOnlySpan<VegetationCullingSelection>(m_Output, 0, m_OutputCount);
+    }
+
+    private void EvaluateClusterRange(int workItemIndex)
+    {
+        if (!VegetationSetupWorkPartition.TryGetRange(
+                m_PlanInputCount,
+                workItemIndex,
+                out int shardStart,
+                out int shardCount))
+        {
+            throw new InvalidOperationException(
+                $"Vegetation culling work item '{workItemIndex}' is outside the " +
+                $"dispatched range of {m_PlanInputCount} clusters.");
+        }
+
+        ReadOnlySpan<VegetationClusterCullingInput> inputs =
+            new(m_PlanInputs, 0, m_PlanInputCount);
+        VegetationCullingView view = m_PlanView;
+        VegetationCullingSettings settings = m_PlanSettings;
+        VegetationCullingShardScratch shard = m_Shards[workItemIndex];
+        VegetationCullingCandidate[] candidates = shard.Candidates;
+        int candidateCount = 0;
+        int culledClusterCount = 0;
+        int culledPageCount = 0;
+        int culledSpeciesCount = 0;
+        int rangeEnd = checked(shardStart + shardCount);
+        for (int inputIndex = shardStart; inputIndex < rangeEnd; inputIndex++)
         {
             ref readonly VegetationClusterCullingInput input = ref inputs[inputIndex];
             if (!input.IsValid ||
@@ -220,12 +363,14 @@ internal sealed class VegetationCullingPlanner
                     input,
                     view,
                     settings,
+                    shard,
                     ref culledPageCount))
             {
                 culledClusterCount++;
                 continue;
             }
 
+            bool[] visiblePages = shard.VisiblePages;
             ReadOnlySpan<CookedVegetationSpecies> species = input.Prepared.Species;
             ReadOnlySpan<VegetationResidentSpecies> residentSpecies = input.Resident.Species;
             for (int speciesIndex = 0; speciesIndex < residentSpecies.Length; speciesIndex++)
@@ -244,7 +389,7 @@ internal sealed class VegetationCullingPlanner
                 ReadOnlySpan<VegetationResidentPageData> pages = input.Resident.Pages;
                 for (int pageIndex = 0; pageIndex < pages.Length; pageIndex++)
                 {
-                    if (!m_VisiblePages[pageIndex] ||
+                    if (!visiblePages[pageIndex] ||
                         !PageContainsSpecies(pages[pageIndex], resident.Guid))
                     {
                         continue;
@@ -316,8 +461,13 @@ internal sealed class VegetationCullingPlanner
                         input.Resident.Guid,
                         input.Resident.Generation,
                         resident.Guid));
-                EnsureCandidateCapacity(m_CandidateCount + 1);
-                m_CandidateStorage[m_CandidateCount++] = new VegetationCullingCandidate(
+                if (candidateCount == candidates.Length)
+                {
+                    shard.GrowCandidates(checked(candidateCount + 1));
+                    candidates = shard.Candidates;
+                }
+
+                candidates[candidateCount++] = new VegetationCullingCandidate(
                     input.Resident.Guid,
                     input.Resident.Generation,
                     resident.Guid,
@@ -334,60 +484,10 @@ internal sealed class VegetationCullingPlanner
             }
         }
 
-        if (m_CandidateCount == 0)
-        {
-            m_HistoryCount = 0;
-            Metrics = new VegetationCullingMetrics(
-                inputs.Length,
-                0,
-                0,
-                culledClusterCount,
-                culledPageCount,
-                culledSpeciesCount,
-                0,
-                0,
-                0,
-                0,
-                0);
-            return ReadOnlySpan<VegetationCullingSelection>.Empty;
-        }
-
-        SortCandidates(m_CandidateStorage, m_CandidateCount);
-        SaveHistory();
-        int visibleSpeciesCount = m_CandidateCount;
-        SelectBudgetedCandidates(settings, out int droppedSpeciesCount);
-        BuildOutput();
-
-        int selectedSpeciesCount = 0;
-        int selectedInstanceCount = 0;
-        int maximumSelectedLod = 0;
-        for (int index = 0; index < m_OutputCount; index++)
-        {
-            ref readonly VegetationCullingSelection selection = ref m_Output[index];
-            if (!selection.Accepted)
-            {
-                continue;
-            }
-
-            selectedSpeciesCount++;
-            selectedInstanceCount = checked(
-                selectedInstanceCount + selection.BudgetInstanceCount);
-            maximumSelectedLod = Math.Max(maximumSelectedLod, selection.LodLevel);
-        }
-
-        Metrics = new VegetationCullingMetrics(
-            inputs.Length,
-            m_CandidateCount,
-            visibleSpeciesCount,
-            culledClusterCount,
-            culledPageCount,
-            culledSpeciesCount,
-            droppedSpeciesCount,
-            selectedSpeciesCount,
-            selectedInstanceCount,
-            selectedSpeciesCount,
-            maximumSelectedLod);
-        return new ReadOnlySpan<VegetationCullingSelection>(m_Output, 0, m_OutputCount);
+        shard.CandidateCount = candidateCount;
+        shard.CulledClusterCount = culledClusterCount;
+        shard.CulledPageCount = culledPageCount;
+        shard.CulledSpeciesCount = culledSpeciesCount;
     }
 
     internal void Reset()
@@ -395,13 +495,15 @@ internal sealed class VegetationCullingPlanner
         m_CandidateCount = 0;
         m_HistoryCount = 0;
         m_OutputCount = 0;
+        m_PlanInputCount = 0;
         Metrics = default;
     }
 
-    private bool TryMarkVisiblePages(
+    private static bool TryMarkVisiblePages(
         in VegetationClusterCullingInput input,
         in VegetationCullingView view,
         in VegetationCullingSettings settings,
+        VegetationCullingShardScratch shard,
         ref int culledPageCount)
     {
         if (!TryGetRelativeBounds(input.Resident.Bounds, view.RenderOrigin, out _, out _) ||
@@ -418,8 +520,9 @@ internal sealed class VegetationCullingPlanner
         }
 
         ReadOnlySpan<VegetationResidentPageData> pages = input.Resident.Pages;
-        EnsurePageCapacity(pages.Length);
-        Array.Clear(m_VisiblePages, 0, pages.Length);
+        shard.EnsurePageCapacity(pages.Length);
+        bool[] visiblePages = shard.VisiblePages;
+        Array.Clear(visiblePages, 0, pages.Length);
         int visiblePageCount = 0;
         CookedVegetationClusterAcceleration? acceleration = input.Prepared.Acceleration;
         if (acceleration == null || acceleration.SpatialNodes.Count == 0)
@@ -428,7 +531,7 @@ internal sealed class VegetationCullingPlanner
             {
                 if (IsPageVisible(pages[pageIndex], view, settings))
                 {
-                    m_VisiblePages[pageIndex] = true;
+                    visiblePages[pageIndex] = true;
                     visiblePageCount++;
                 }
                 else
@@ -440,12 +543,13 @@ internal sealed class VegetationCullingPlanner
             return visiblePageCount > 0;
         }
 
-        EnsureNodeCapacity(acceleration.SpatialNodes.Count);
+        shard.EnsureNodeCapacity(acceleration.SpatialNodes.Count);
+        int[] nodeStack = shard.NodeStack;
         int stackCount = 1;
-        m_NodeStack[0] = 0;
+        nodeStack[0] = 0;
         while (stackCount > 0)
         {
-            int nodeIndex = m_NodeStack[--stackCount];
+            int nodeIndex = nodeStack[--stackCount];
             CookedVegetationSpatialNode node = acceleration.SpatialNodes[nodeIndex];
             if ((settings.EnableFrustumCulling && !IsVisible(node.Bounds, view)) ||
                 (settings.EnableDistanceCulling &&
@@ -460,9 +564,9 @@ internal sealed class VegetationCullingPlanner
                 int pageIndex = node.FirstPageIndex;
                 if (pageIndex >= 0 && pageIndex < pages.Length &&
                     IsPageVisible(pages[pageIndex], view, settings) &&
-                    !m_VisiblePages[pageIndex])
+                    !visiblePages[pageIndex])
                 {
-                    m_VisiblePages[pageIndex] = true;
+                    visiblePages[pageIndex] = true;
                     visiblePageCount++;
                 }
                 continue;
@@ -470,17 +574,17 @@ internal sealed class VegetationCullingPlanner
 
             if (node.RightChildIndex >= 0)
             {
-                m_NodeStack[stackCount++] = node.RightChildIndex;
+                nodeStack[stackCount++] = node.RightChildIndex;
             }
             if (node.LeftChildIndex >= 0)
             {
-                m_NodeStack[stackCount++] = node.LeftChildIndex;
+                nodeStack[stackCount++] = node.LeftChildIndex;
             }
         }
 
         for (int pageIndex = 0; pageIndex < pages.Length; pageIndex++)
         {
-            if (!m_VisiblePages[pageIndex])
+            if (!visiblePages[pageIndex])
             {
                 culledPageCount++;
             }
@@ -994,34 +1098,39 @@ internal sealed class VegetationCullingPlanner
         Array.Resize(ref m_Output, capacity);
     }
 
-    private void EnsureNodeCapacity(int required)
+    private void EnsureShardCapacity(int workItemCount)
     {
-        if (required <= m_NodeStack.Length)
+        if (m_Shards.Length < workItemCount)
         {
-            return;
+            int capacity = Math.Max(4, m_Shards.Length);
+            while (capacity < workItemCount)
+            {
+                capacity = checked(capacity * 2);
+            }
+
+            var shards = new VegetationCullingShardScratch[capacity];
+            Array.Copy(m_Shards, shards, m_Shards.Length);
+            for (int index = m_Shards.Length; index < capacity; index++)
+            {
+                shards[index] = new VegetationCullingShardScratch();
+            }
+
+            m_Shards = shards;
         }
 
-        int capacity = Math.Max(4, m_NodeStack.Length);
-        while (capacity < required)
+        for (int workItemIndex = 0; workItemIndex < workItemCount; workItemIndex++)
         {
-            capacity = checked(capacity * 2);
-        }
-        Array.Resize(ref m_NodeStack, capacity);
-    }
+            if (!VegetationSetupWorkPartition.TryGetRange(
+                    m_PlanInputCount,
+                    workItemIndex,
+                    out _,
+                    out int shardInputCount))
+            {
+                return;
+            }
 
-    private void EnsurePageCapacity(int required)
-    {
-        if (required <= m_VisiblePages.Length)
-        {
-            return;
+            m_Shards[workItemIndex].SeedCandidateCapacity(shardInputCount);
         }
-
-        int capacity = Math.Max(4, m_VisiblePages.Length);
-        while (capacity < required)
-        {
-            capacity = checked(capacity * 2);
-        }
-        Array.Resize(ref m_VisiblePages, capacity);
     }
 
     private static void SortCandidates(
@@ -1153,6 +1262,53 @@ internal sealed class VegetationCullingPlanner
 
         result = leftGeneration.CompareTo(rightGeneration);
         return result != 0 ? result : leftSpecies.CompareTo(rightSpecies);
+    }
+
+    /// <summary>
+    /// Scratch owned by exactly one culling work item. Shards never share buffers, so a
+    /// dispatch cannot race, and merging shards in work-item order reproduces the serial
+    /// candidate order.
+    /// </summary>
+    private sealed class VegetationCullingShardScratch
+    {
+        private const int MinimumCandidateCapacity = 8;
+
+        public VegetationCullingCandidate[] Candidates =
+            Array.Empty<VegetationCullingCandidate>();
+        public bool[] VisiblePages = Array.Empty<bool>();
+        public int[] NodeStack = Array.Empty<int>();
+        public int CandidateCount;
+        public int CulledClusterCount;
+        public int CulledPageCount;
+        public int CulledSpeciesCount;
+
+        public void SeedCandidateCapacity(int shardInputCount) =>
+            GrowBuffer(ref Candidates, Math.Max(MinimumCandidateCapacity, shardInputCount));
+
+        public void GrowCandidates(int required) =>
+            GrowBuffer(ref Candidates, Math.Max(MinimumCandidateCapacity, required));
+
+        public void EnsurePageCapacity(int required) =>
+            GrowBuffer(ref VisiblePages, required);
+
+        public void EnsureNodeCapacity(int required) =>
+            GrowBuffer(ref NodeStack, required);
+
+        private static void GrowBuffer<T>(ref T[] buffer, int required)
+        {
+            if (buffer.Length >= required)
+            {
+                return;
+            }
+
+            int capacity = Math.Max(4, buffer.Length);
+            while (capacity < required)
+            {
+                capacity = checked(capacity * 2);
+            }
+
+            Array.Resize(ref buffer, capacity);
+        }
     }
 
     private struct VegetationCullingCandidate

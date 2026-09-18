@@ -19,7 +19,7 @@ internal sealed class VegetationGenericRenderPipelineFeature : IGenericRenderPip
     private readonly VegetationPreparedAssetProvider m_PreparedAssets;
     private readonly VegetationOpaquePass m_OpaquePass;
     private readonly VegetationShadowPass m_ShadowPass;
-    private readonly VegetationCullingPlanner m_CullingPlanner = new();
+    private readonly VegetationCullingPlanner m_CullingPlanner;
     private readonly VegetationRenderValidationMode m_ValidationMode;
     private readonly VegetationSetupWorkDispatcher m_SetupDispatcher;
     private readonly Action<int> m_GatherSetupWork;
@@ -79,6 +79,7 @@ internal sealed class VegetationGenericRenderPipelineFeature : IGenericRenderPip
         m_ShadowPass = shadowPass ?? throw new ArgumentNullException(nameof(shadowPass));
         m_ValidationMode = validationMode;
         m_SetupDispatcher = new VegetationSetupWorkDispatcher(taskSystem);
+        m_CullingPlanner = new VegetationCullingPlanner(taskSystem);
         m_GatherSetupWork = RunGatherSetupWorkItem;
         m_PrepareSetupWork = RunPrepareSetupWorkItem;
     }
