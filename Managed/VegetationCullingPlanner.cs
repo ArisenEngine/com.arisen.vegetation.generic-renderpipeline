@@ -284,10 +284,10 @@ internal sealed class VegetationCullingPlanner
                     }
                 }
 
-            if (visibleInstanceCount == 0 || visiblePageCount == 0)
-            {
-                culledSpeciesCount++;
-                continue;
+                if (visibleInstanceCount == 0 || visiblePageCount == 0)
+                {
+                    culledSpeciesCount++;
+                    continue;
                 }
 
                 if (TryFindSpeciesAcceleration(
