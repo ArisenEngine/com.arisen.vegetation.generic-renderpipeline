@@ -2,6 +2,7 @@ using ArisenEngine.Core.Diagnostics;
 using ArisenEngine.Rendering;
 using ArisenEngine.Resources.Serialization;
 using ArisenEngine.Vegetation.Assets;
+using ArisenEngine.Threading;
 using ArisenKernel.Diagnostics;
 
 namespace ArisenEngine.Vegetation.GenericRenderPipeline;
@@ -20,9 +21,13 @@ internal sealed class VegetationGenericRenderPipelineFeature : IGenericRenderPip
     private readonly VegetationShadowPass m_ShadowPass;
     private readonly VegetationCullingPlanner m_CullingPlanner = new();
     private readonly VegetationRenderValidationMode m_ValidationMode;
+    private readonly VegetationSetupWorkDispatcher m_SetupDispatcher;
+    private readonly Action<int> m_GatherSetupWork;
+    private readonly Action<int> m_PrepareSetupWork;
     private VegetationClusterComponent[] m_ExtractedClusters =
         Array.Empty<VegetationClusterComponent>();
-    private PreparedClusterFrame[] m_PreparedClusters = Array.Empty<PreparedClusterFrame>();
+    private VegetationPreparedClusterFrame[] m_PreparedClusters =
+        Array.Empty<VegetationPreparedClusterFrame>();
     private VegetationOpaquePreparedDraw[] m_OpaqueDraws =
         Array.Empty<VegetationOpaquePreparedDraw>();
     private VegetationShadowPreparedDraw[] m_ShadowDraws =
@@ -47,6 +52,10 @@ internal sealed class VegetationGenericRenderPipelineFeature : IGenericRenderPip
         Array.Empty<VegetationCullingSelection>();
     private int m_CullingInputCount;
     private int m_CullingSelectionCount;
+    private readonly VegetationSetupShardBuffer<VegetationClusterCullingInput>
+        m_CullingInputRegions = new();
+    private readonly VegetationSetupShardBuffer<VegetationPreparedClusterFrame>
+        m_PreparedClusterRegions = new();
 
     public VegetationGenericRenderPipelineFeature(
         IVegetationClusterRenderSource renderSource,
@@ -56,7 +65,8 @@ internal sealed class VegetationGenericRenderPipelineFeature : IGenericRenderPip
         VegetationPreparedAssetProvider preparedAssets,
         VegetationOpaquePass opaquePass,
         VegetationShadowPass shadowPass,
-        VegetationRenderValidationMode validationMode)
+        VegetationRenderValidationMode validationMode,
+        ITaskGraph? taskSystem = null)
     {
         m_RenderSource = renderSource ?? throw new ArgumentNullException(nameof(renderSource));
         m_ClusterData = clusterData ?? throw new ArgumentNullException(nameof(clusterData));
@@ -68,6 +78,9 @@ internal sealed class VegetationGenericRenderPipelineFeature : IGenericRenderPip
         m_OpaquePass = opaquePass ?? throw new ArgumentNullException(nameof(opaquePass));
         m_ShadowPass = shadowPass ?? throw new ArgumentNullException(nameof(shadowPass));
         m_ValidationMode = validationMode;
+        m_SetupDispatcher = new VegetationSetupWorkDispatcher(taskSystem);
+        m_GatherSetupWork = RunGatherSetupWorkItem;
+        m_PrepareSetupWork = RunPrepareSetupWorkItem;
     }
 
     public string FeatureId => Id;
@@ -278,34 +291,21 @@ internal sealed class VegetationGenericRenderPipelineFeature : IGenericRenderPip
         m_DroppedDrawCount = 0;
         m_CullingInputCount = 0;
         m_CullingSelectionCount = 0;
-        ReadOnlySpan<VegetationResidentClusterData> residentClusters =
-            m_RuntimeSnapshot.Clusters;
-        for (int componentIndex = 0;
-             componentIndex < m_ExtractedClusterCount;
-             componentIndex++)
+        using (Profiler.Zone("Vegetation.GatherCullingInputs"))
         {
-            ref readonly VegetationClusterComponent component =
-                ref m_ExtractedClusters[componentIndex];
-            if (!VegetationClusterLookup.TryFindResidentCluster(
-                    residentClusters,
-                    component.ClusterGuid,
-                    out VegetationResidentClusterData resident) ||
-                !MatchesComponent(component, resident) ||
-                !m_PreparedAssets.TryGetCluster(
-                    component.ClusterGuid,
-                    resident.Generation,
-                    out VegetationPreparedClusterView prepared))
-            {
-                m_DroppedDrawCount++;
-                continue;
-            }
-
-            EnsureCapacity(ref m_CullingInputs, m_CullingInputCount + 1);
-            m_CullingInputs[m_CullingInputCount++] = new VegetationClusterCullingInput(
-                component,
-                resident,
-                prepared);
-
+            int gatherWorkItemCount =
+                VegetationSetupWorkPartition.GetWorkItemCount(m_ExtractedClusterCount);
+            m_CullingInputRegions.EnsureRegions(
+                gatherWorkItemCount,
+                VegetationSetupWorkPartition.MaximumInputsPerWorkItem);
+            m_SetupDispatcher.Dispatch(m_ExtractedClusterCount, m_GatherSetupWork);
+            EnsureCapacity(ref m_CullingInputs, m_ExtractedClusterCount);
+            m_CullingInputCount = m_CullingInputRegions.MergeInto(
+                new Span<VegetationClusterCullingInput>(
+                    m_CullingInputs,
+                    0,
+                    m_ExtractedClusterCount));
+            m_DroppedDrawCount += m_ExtractedClusterCount - m_CullingInputCount;
         }
 
         using var cullingZone = Profiler.Zone("Vegetation.CullingPlan");
@@ -320,56 +320,112 @@ internal sealed class VegetationGenericRenderPipelineFeature : IGenericRenderPip
         selections.CopyTo(m_CullingSelections);
         m_CullingSelectionCount = selections.Length;
 
-        for (int inputIndex = 0; inputIndex < m_CullingInputCount; inputIndex++)
+        using (Profiler.Zone("Vegetation.PrepareDrawSetup"))
         {
-            ref readonly VegetationClusterCullingInput input = ref m_CullingInputs[inputIndex];
-            VegetationClusterComponent component = input.Component;
-            if (!VegetationClusterLookup.TryFindSelection(
-                    new ReadOnlySpan<VegetationCullingSelection>(
-                        m_CullingSelections,
-                        0,
-                        m_CullingSelectionCount),
-                    input.Resident.Guid,
-                    out VegetationCullingSelection selection) ||
-                !selection.Accepted)
-            {
-                m_DroppedDrawCount++;
-                continue;
-            }
+            int preparedWorkItemCount =
+                VegetationSetupWorkPartition.GetWorkItemCount(m_CullingInputCount);
+            m_PreparedClusterRegions.EnsureRegions(
+                preparedWorkItemCount,
+                VegetationSetupWorkPartition.MaximumInputsPerWorkItem);
+            m_SetupDispatcher.Dispatch(m_CullingInputCount, m_PrepareSetupWork);
+            EnsureCapacity(ref m_PreparedClusters, m_CullingInputCount);
+            m_PreparedClusterCount = m_PreparedClusterRegions.MergeInto(
+                new Span<VegetationPreparedClusterFrame>(
+                    m_PreparedClusters,
+                    0,
+                    m_CullingInputCount));
+            m_DroppedDrawCount += m_CullingInputCount - m_PreparedClusterCount;
+        }
 
-            EnsureCapacity(ref m_PreparedClusters, m_PreparedClusterCount + 1);
-            m_PreparedClusters[m_PreparedClusterCount++] = new PreparedClusterFrame(
-                component,
-                input.Prepared,
-                selection);
-            bool receiveShadows =
-                (component.Flags & VegetationClusterFlags.ReceiveShadows) != 0;
-            ReadOnlySpan<VegetationPreparedBatch> batches = input.Prepared.Batches;
-            for (int batchIndex = 0; batchIndex < batches.Length; batchIndex++)
+        using (Profiler.Zone("Vegetation.EmitOpaqueDraws"))
+        {
+            for (int clusterIndex = 0;
+                 clusterIndex < m_PreparedClusterCount;
+                 clusterIndex++)
             {
-                ref readonly VegetationPreparedBatch batch = ref batches[batchIndex];
-                if (batch.SpeciesGuid != selection.SpeciesGuid ||
-                    batch.LodLevel != selection.LodLevel)
+                ref readonly VegetationPreparedClusterFrame cluster =
+                    ref m_PreparedClusters[clusterIndex];
+                bool receiveShadows =
+                    (cluster.Component.Flags & VegetationClusterFlags.ReceiveShadows) != 0;
+                ReadOnlySpan<VegetationPreparedBatch> batches = cluster.Prepared.Batches;
+                for (int batchIndex = 0; batchIndex < batches.Length; batchIndex++)
                 {
-                    continue;
-                }
+                    ref readonly VegetationPreparedBatch batch = ref batches[batchIndex];
+                    if (batch.SpeciesGuid != cluster.Selection.SpeciesGuid ||
+                        batch.LodLevel != cluster.Selection.LodLevel)
+                    {
+                        continue;
+                    }
 
-                EnsureCapacity(ref m_OpaqueDraws, checked(m_OpaqueDrawCount + 1));
-                VegetationOpaqueDrawConstants constants =
-                    VegetationOpaqueDrawConstants.Create(
-                        context.RenderContext.RenderOrigin,
-                        input.Prepared.Origin,
-                        batch,
-                        frameBufferIndex,
-                        receiveShadows,
-                        context.DirectionalShadow);
-                m_OpaqueDraws[m_OpaqueDrawCount++] = new VegetationOpaquePreparedDraw(
-                    batch,
-                    constants);
+                    EnsureCapacity(
+                        ref m_OpaqueDraws,
+                        checked(m_OpaqueDrawCount + 1));
+                    VegetationOpaqueDrawConstants constants =
+                        VegetationOpaqueDrawConstants.Create(
+                            context.RenderContext.RenderOrigin,
+                            cluster.Prepared.Origin,
+                            batch,
+                            frameBufferIndex,
+                            receiveShadows,
+                            context.DirectionalShadow);
+                    m_OpaqueDraws[m_OpaqueDrawCount++] =
+                        new VegetationOpaquePreparedDraw(batch, constants);
+                }
             }
         }
 
         m_OpaquePass.SetPreparedDraws(m_OpaqueDraws, m_OpaqueDrawCount);
+    }
+
+    private void RunGatherSetupWorkItem(int workItemIndex)
+    {
+        if (!VegetationSetupWorkPartition.TryGetRange(
+                m_ExtractedClusterCount,
+                workItemIndex,
+                out int start,
+                out int count))
+        {
+            throw new InvalidOperationException(
+                $"Vegetation gather work item '{workItemIndex}' is outside the " +
+                $"dispatched range of {m_ExtractedClusterCount} items.");
+        }
+
+        int written = VegetationPreparedSetup.GatherCullingInputs(
+            m_ExtractedClusters,
+            start,
+            count,
+            m_RuntimeSnapshot.Clusters,
+            m_PreparedAssets,
+            m_CullingInputRegions.GetRegion(workItemIndex));
+        m_CullingInputRegions.SetCount(workItemIndex, written);
+    }
+
+    private void RunPrepareSetupWorkItem(int workItemIndex)
+    {
+        if (!VegetationSetupWorkPartition.TryGetRange(
+                m_CullingInputCount,
+                workItemIndex,
+                out int start,
+                out int count))
+        {
+            throw new InvalidOperationException(
+                $"Vegetation prepare work item '{workItemIndex}' is outside the " +
+                $"dispatched range of {m_CullingInputCount} items.");
+        }
+
+        int written = VegetationPreparedSetup.BuildPreparedFrames(
+            new ReadOnlySpan<VegetationClusterCullingInput>(
+                m_CullingInputs,
+                0,
+                m_CullingInputCount),
+            start,
+            count,
+            new ReadOnlySpan<VegetationCullingSelection>(
+                m_CullingSelections,
+                0,
+                m_CullingSelectionCount),
+            m_PreparedClusterRegions.GetRegion(workItemIndex));
+        m_PreparedClusterRegions.SetCount(workItemIndex, written);
     }
 
     private void PrepareShadowDraws(
@@ -398,7 +454,7 @@ internal sealed class VegetationGenericRenderPipelineFeature : IGenericRenderPip
                  clusterIndex < m_PreparedClusterCount;
                  clusterIndex++)
             {
-                ref readonly PreparedClusterFrame cluster =
+                ref readonly VegetationPreparedClusterFrame cluster =
                     ref m_PreparedClusters[clusterIndex];
                 if ((cluster.Component.Flags & VegetationClusterFlags.CastShadows) == 0)
                 {
@@ -449,18 +505,6 @@ internal sealed class VegetationGenericRenderPipelineFeature : IGenericRenderPip
             m_ShadowDrawCount,
             m_ShadowDrawRanges);
     }
-
-    private static bool MatchesComponent(
-        in VegetationClusterComponent component,
-        VegetationResidentClusterData resident) =>
-        resident.BiomeGuid == component.BiomeGuid &&
-        resident.ContainsSpecies(component.SpeciesGuid) &&
-        resident.Origin == new WorldPosition(
-            component.OriginX,
-            component.OriginY,
-            component.OriginZ) &&
-        resident.PageCount == component.PageCount &&
-        resident.InstanceCount == component.InstanceCount;
 
     private static VegetationCullingView CreateCullingView(
         in GenericRenderPipelineFeatureFrameContext context)
@@ -627,23 +671,6 @@ internal sealed class VegetationGenericRenderPipelineFeature : IGenericRenderPip
             capacity = checked(capacity * 2);
         }
         Array.Resize(ref storage, capacity);
-    }
-
-    private readonly struct PreparedClusterFrame
-    {
-        public PreparedClusterFrame(
-            in VegetationClusterComponent component,
-            in VegetationPreparedClusterView prepared,
-            in VegetationCullingSelection selection)
-        {
-            Component = component;
-            Prepared = prepared;
-            Selection = selection;
-        }
-
-        public VegetationClusterComponent Component { get; }
-        public VegetationPreparedClusterView Prepared { get; }
-        public VegetationCullingSelection Selection { get; }
     }
 
     private readonly record struct ReportedSurfaceGeneration(

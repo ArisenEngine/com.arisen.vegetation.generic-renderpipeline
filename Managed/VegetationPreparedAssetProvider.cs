@@ -16,6 +16,7 @@ internal enum VegetationPreparedPublicationStage
 
 internal sealed class VegetationPreparedAssetProvider :
     IRuntimePreparedAssetProvider,
+    IVegetationPreparedClusterSource,
     IDisposable
 {
     public const string Id =
@@ -228,7 +229,7 @@ internal sealed class VegetationPreparedAssetProvider :
         return true;
     }
 
-    internal bool TryGetCluster(
+    public bool TryGetCluster(
         Guid clusterGuid,
         ulong generation,
         out VegetationPreparedClusterView cluster)

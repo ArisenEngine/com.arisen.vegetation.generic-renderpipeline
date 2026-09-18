@@ -73,7 +73,8 @@ public sealed class VegetationGenericRenderPipelinePackage : IPackageEntry
                 m_PreparedAssets,
                 new VegetationOpaquePass(assetDatabase),
                 new VegetationShadowPass(assetDatabase),
-                validationMode);
+                validationMode,
+                services.GetService<ITaskGraph>());
 
             m_ShaderRegistry.RegisterRuntimeShaders(
                 VegetationGenericRenderPipelineFeature.Id,
