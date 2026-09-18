@@ -340,13 +340,6 @@ internal sealed class VegetationShadowPass : RenderPassNode
     {
         Volatile.Write(ref m_LastRecordedBatchCount, 0);
         Volatile.Write(ref m_LastRecordedInstanceCount, 0);
-        if (!m_Pipeline.IsValid || m_Width == 0 || m_Height == 0)
-        {
-            return;
-        }
-
-        int recordedBatches = 0;
-        long recordedInstances = 0;
         for (int cascadeIndex = 0;
              cascadeIndex < m_DrawRanges.Count;
              cascadeIndex++)
@@ -358,54 +351,110 @@ internal sealed class VegetationShadowPass : RenderPassNode
                 continue;
             }
 
-            commandList.BeginRenderingDepthOnly(
-                m_DepthTargets[cascadeIndex],
-                EImageLayout.IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-                EAttachmentLoadOp.ATTACHMENT_LOAD_OP_LOAD,
-                EAttachmentStoreOp.ATTACHMENT_STORE_OP_STORE,
-                1.0f,
-                0,
-                0,
-                0,
-                m_Width,
-                m_Height);
-            commandList.BindPipeline(m_Pipeline);
-            commandList.SetViewport(0, 0, m_Width, m_Height);
-            commandList.SetScissor(0, 0, m_Width, m_Height);
-            for (int drawIndex = range.Start;
-                 drawIndex < range.End;
-                 drawIndex++)
-            {
-                ref readonly VegetationShadowPreparedDraw draw =
-                    ref m_Draws[drawIndex];
-                if (!draw.IsValid)
-                {
-                    continue;
-                }
+            RecordCascadeRange(commandList, cascadeIndex, range.Start, range.Count);
+        }
+    }
 
-                commandList.PushConstants(
-                    draw.Constants,
-                    EShaderStage.SHADER_STAGE_VERTEX_BIT);
-                commandList.BindVertexBuffers(draw.VertexBuffer);
-                commandList.BindIndexBuffer(
-                    draw.IndexBuffer,
-                    0,
-                    draw.IndexType);
-                commandList.DrawIndexed(
-                    draw.IndexCount,
-                    instanceCount: draw.InstanceCount,
-                    firstIndex: draw.FirstIndex,
-                    vertexOffset: draw.VertexOffset,
-                    firstInstance: draw.FirstInstance);
-                recordedBatches++;
-                recordedInstances += draw.InstanceCount;
-            }
+    protected override int GetWorkItemCount(RenderContext context) =>
+        VegetationShadowDrawWorkPartition.GetWorkItemCount(m_DrawRanges);
 
-            commandList.EndRendering();
+    protected override RenderPassWorkItem GetWorkItem(
+        RenderContext context,
+        int workItemIndex)
+    {
+        if (!VegetationShadowDrawWorkPartition.TryGetRange(
+                m_DrawRanges,
+                workItemIndex,
+                out VegetationShadowDrawRange range))
+        {
+            return RenderPassWorkItem.Pass(workItemIndex);
         }
 
-        Volatile.Write(ref m_LastRecordedBatchCount, recordedBatches);
-        Volatile.Write(ref m_LastRecordedInstanceCount, recordedInstances);
+        return RenderPassWorkItem.DrawRange(workItemIndex, range.Start, range.Count);
+    }
+
+    protected override void Record(
+        RenderContext context,
+        RenderCommandList commandList,
+        RenderPassWorkItem workItem)
+    {
+        if (!workItem.HasDrawRange ||
+            !VegetationShadowDrawWorkPartition.TryGetRange(
+                m_DrawRanges,
+                workItem.Index,
+                out VegetationShadowDrawRange range))
+        {
+            return;
+        }
+
+        RecordCascadeRange(commandList, range.CascadeIndex, range.Start, range.Count);
+    }
+
+    private void RecordCascadeRange(
+        RenderCommandList commandList,
+        int cascadeIndex,
+        int drawStart,
+        int drawCount)
+    {
+        if (!m_Pipeline.IsValid ||
+            m_Width == 0 ||
+            m_Height == 0 ||
+            drawCount <= 0 ||
+            (uint)cascadeIndex >= (uint)m_DepthTargets.Length)
+        {
+            return;
+        }
+
+        int drawEnd = checked(drawStart + drawCount);
+        int recordedBatches = 0;
+        long recordedInstances = 0;
+        commandList.BeginRenderingDepthOnly(
+            m_DepthTargets[cascadeIndex],
+            EImageLayout.IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+            EAttachmentLoadOp.ATTACHMENT_LOAD_OP_LOAD,
+            EAttachmentStoreOp.ATTACHMENT_STORE_OP_STORE,
+            1.0f,
+            0,
+            0,
+            0,
+            m_Width,
+            m_Height);
+        commandList.BindPipeline(m_Pipeline);
+        commandList.SetViewport(0, 0, m_Width, m_Height);
+        commandList.SetScissor(0, 0, m_Width, m_Height);
+        for (int drawIndex = drawStart;
+             drawIndex < drawEnd;
+             drawIndex++)
+        {
+            ref readonly VegetationShadowPreparedDraw draw =
+                ref m_Draws[drawIndex];
+            if (!draw.IsValid)
+            {
+                continue;
+            }
+
+            commandList.PushConstants(
+                draw.Constants,
+                EShaderStage.SHADER_STAGE_VERTEX_BIT);
+            commandList.BindVertexBuffers(draw.VertexBuffer);
+            commandList.BindIndexBuffer(
+                draw.IndexBuffer,
+                0,
+                draw.IndexType);
+            commandList.DrawIndexed(
+                draw.IndexCount,
+                instanceCount: draw.InstanceCount,
+                firstIndex: draw.FirstIndex,
+                vertexOffset: draw.VertexOffset,
+                firstInstance: draw.FirstInstance);
+            recordedBatches++;
+            recordedInstances += draw.InstanceCount;
+        }
+
+        commandList.EndRendering();
+
+        Interlocked.Add(ref m_LastRecordedBatchCount, recordedBatches);
+        Interlocked.Add(ref m_LastRecordedInstanceCount, recordedInstances);
     }
 
     public void ReleaseDeviceResources()
