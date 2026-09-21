@@ -1,5 +1,7 @@
 using Arisen.Native.RHI;
 using ArisenEngine.Core.RHI;
+using ArisenEngine.Rendering;
+using ArisenEngine.Rendering.Resources;
 using ArisenEngine.Resources.Serialization;
 using ArisenEngine.Vegetation.Assets;
 using System.Numerics;
@@ -12,7 +14,12 @@ internal readonly struct VegetationGpuInstance
 {
     public const int Stride = 48;
 
-    public readonly Vector4 OriginRelativePositionScale;
+    /// <summary>
+    /// XYZ is the instance position relative to its cluster origin. The cluster origin itself is
+    /// supplied per draw and is expressed in the view frame, so this record stays independent of
+    /// the world origin and can be uploaded once.
+    /// </summary>
+    public readonly Vector4 ClusterRelativePositionScale;
     public readonly Quaternion Orientation;
     public readonly uint StableVariation;
     public readonly float WindPhase;
@@ -20,19 +27,52 @@ internal readonly struct VegetationGpuInstance
     public readonly uint Flags;
 
     public VegetationGpuInstance(
-        Vector4 originRelativePositionScale,
+        Vector4 clusterRelativePositionScale,
         Quaternion orientation,
         uint stableVariation,
         float windPhase,
         float colorVariation,
         uint flags)
     {
-        OriginRelativePositionScale = originRelativePositionScale;
+        ClusterRelativePositionScale = clusterRelativePositionScale;
         Orientation = orientation;
         StableVariation = stableVariation;
         WindPhase = windPhase;
         ColorVariation = colorVariation;
         Flags = flags;
+    }
+}
+
+/// <summary>
+/// The vegetation opaque and shadow passes render in the view frame: every vertex position they
+/// consume is relative to the render camera, and the frame's view-projection is the rotation-only
+/// <see cref="Camera.ViewRelativeViewMatrix"/> times the projection. Both the anchor and the matrix
+/// then come from the camera instead of the rebaseable world origin, which is what keeps the pass
+/// bit-stable across an origin rebase: origin-relative float positions at kilometre distances
+/// quantize to roughly a tenth of a millimetre, which is enough to move rasterized vegetation
+/// depth and alpha coverage.
+/// </summary>
+internal static class VegetationViewFrame
+{
+    public static Vector3 ToViewRelativePosition(
+        WorldPosition worldPosition,
+        WorldPosition cameraWorldPosition)
+    {
+        double x = worldPosition.X - cameraWorldPosition.X;
+        double y = worldPosition.Y - cameraWorldPosition.Y;
+        double z = worldPosition.Z - cameraWorldPosition.Z;
+        if (!double.IsFinite(x) ||
+            !double.IsFinite(y) ||
+            !double.IsFinite(z) ||
+            Math.Abs(x) > float.MaxValue ||
+            Math.Abs(y) > float.MaxValue ||
+            Math.Abs(z) > float.MaxValue)
+        {
+            throw new InvalidOperationException(
+                "[Vegetation.GenericRP] Cluster is outside the view-frame float range.");
+        }
+
+        return new Vector3((float)x, (float)y, (float)z);
     }
 }
 
@@ -114,27 +154,342 @@ internal static class VegetationGpuInstancePacking
         float.IsFinite(value.W);
 }
 
+[Flags]
+internal enum VegetationMaterialFlags : uint
+{
+    None = 0u,
+    AlphaTest = 1u << 0,
+    TintVariation = 1u << 1
+}
+
+internal readonly record struct VegetationMaterialSemantics(
+    Vector4 BaseColorFactor,
+    float AlphaCutoff,
+    float MetallicFactor,
+    float RoughnessFactor,
+    float OcclusionStrength,
+    float TintVariation,
+    VegetationMaterialFlags Flags);
+
+internal static class VegetationMaterialContract
+{
+    public const string TintVariationProperty = "TintVariation";
+    private const uint InvalidBindlessIndex = 0xFFFFFFFFu;
+
+    public static VegetationMaterialSemantics Resolve(
+        MaterialAsset asset,
+        Guid materialGuid)
+    {
+        ArgumentNullException.ThrowIfNull(asset);
+        if (materialGuid == Guid.Empty)
+        {
+            throw new ArgumentException(
+                "[Vegetation.GenericRP] Vegetation material GUID cannot be empty.",
+                nameof(materialGuid));
+        }
+
+        MaterialRenderState state = asset.RenderState;
+        if (state.BlendEnabled ||
+            state.CullMode != ECullModeFlagBits.CULL_MODE_NONE ||
+            state.FrontFace != EFrontFace.FRONT_FACE_COUNTER_CLOCKWISE)
+        {
+            throw new NotSupportedException(
+                $"Vegetation material '{materialGuid:D}' must use the opaque, two-sided, " +
+                "counter-clockwise render-state contract.");
+        }
+
+        RequireTexture(
+            asset,
+            materialGuid,
+            MaterialTextureSlots.BaseColor,
+            Texture2DVariantKey.MipmappedSRgb,
+            required: true);
+        RequireTexture(
+            asset,
+            materialGuid,
+            MaterialTextureSlots.Normal,
+            Texture2DVariantKey.MipmappedNormal,
+            required: true);
+        RequireTexture(
+            asset,
+            materialGuid,
+            MaterialTextureSlots.MetallicRoughness,
+            Texture2DVariantKey.MipmappedLinear,
+            required: true);
+        if (FindTexture(asset, MaterialTextureSlots.Occlusion) != null)
+        {
+            throw new NotSupportedException(
+                $"Vegetation material '{materialGuid:D}' must bind its combined occlusion, " +
+                "roughness, and metallic channels through the MetallicRoughness texture; " +
+                "the Occlusion slot is not part of the vegetation material contract.");
+        }
+
+        Vector4 baseColorFactor = ResolveVector4(
+            asset,
+            MaterialPropertySlots.BaseColorFactor,
+            Vector4.One,
+            materialGuid,
+            minimum: 0.0f,
+            maximum: 1.0f);
+        float alphaCutoff = ResolveScalar(
+            asset,
+            MaterialPropertySlots.AlphaCutoff,
+            0.0f,
+            materialGuid,
+            minimum: 0.0f,
+            maximum: 1.0f);
+        float metallicFactor = ResolveScalar(
+            asset,
+            MaterialPropertySlots.MetallicFactor,
+            0.0f,
+            materialGuid,
+            minimum: 0.0f,
+            maximum: 1.0f);
+        float roughnessFactor = ResolveScalar(
+            asset,
+            MaterialPropertySlots.RoughnessFactor,
+            1.0f,
+            materialGuid,
+            minimum: 0.04f,
+            maximum: 1.0f);
+        float occlusionStrength = ResolveScalar(
+            asset,
+            MaterialPropertySlots.OcclusionStrength,
+            MaterialPbrDefaults.OcclusionStrength,
+            materialGuid,
+            minimum: 0.0f,
+            maximum: 1.0f);
+        float tintVariation = ResolveScalar(
+            asset,
+            TintVariationProperty,
+            0.0f,
+            materialGuid,
+            minimum: 0.0f,
+            maximum: 1.0f);
+
+        VegetationMaterialFlags flags = VegetationMaterialFlags.None;
+        if (alphaCutoff > 0.0f)
+        {
+            flags |= VegetationMaterialFlags.AlphaTest;
+        }
+        if (tintVariation > 0.0f)
+        {
+            flags |= VegetationMaterialFlags.TintVariation;
+        }
+
+        return new VegetationMaterialSemantics(
+            baseColorFactor,
+            alphaCutoff,
+            metallicFactor,
+            roughnessFactor,
+            occlusionStrength,
+            tintVariation,
+            flags);
+    }
+
+    private static void RequireTexture(
+        MaterialAsset asset,
+        Guid materialGuid,
+        string slot,
+        Texture2DVariantKey requiredVariant,
+        bool required)
+    {
+        MaterialTexture2DRef? texture = FindTexture(asset, slot);
+        if (texture == null)
+        {
+            if (required)
+            {
+                throw new NotSupportedException(
+                    $"Vegetation material '{materialGuid:D}' must provide a '{slot}' texture.");
+            }
+
+            return;
+        }
+
+        Texture2DVariantKey declared = texture.Value.Texture.Variant;
+        if (declared != requiredVariant)
+        {
+            throw new NotSupportedException(
+                $"Vegetation material '{materialGuid:D}' texture '{slot}' declares variant " +
+                $"'{declared.GetCookedVariant()}'; the vegetation contract requires " +
+                $"'{requiredVariant.GetCookedVariant()}'.");
+        }
+    }
+
+    private static MaterialTexture2DRef? FindTexture(MaterialAsset asset, string slot)
+    {
+        IReadOnlyList<MaterialTexture2DRef>? refs = asset.Texture2DRefs;
+        if (refs == null)
+        {
+            return null;
+        }
+
+        for (int index = 0; index < refs.Count; index++)
+        {
+            if (string.Equals(refs[index].Name, slot, StringComparison.OrdinalIgnoreCase))
+            {
+                return refs[index];
+            }
+        }
+
+        return null;
+    }
+
+    private static float ResolveScalar(
+        MaterialAsset asset,
+        string property,
+        float defaultValue,
+        Guid materialGuid,
+        float minimum,
+        float maximum)
+    {
+        float value = defaultValue;
+        IReadOnlyList<MaterialScalarProperty>? properties = asset.ScalarProperties;
+        if (properties != null)
+        {
+            for (int index = 0; index < properties.Count; index++)
+            {
+                if (string.Equals(properties[index].Name, property, StringComparison.OrdinalIgnoreCase))
+                {
+                    value = properties[index].Value;
+                    break;
+                }
+            }
+        }
+
+        if (!float.IsFinite(value) || value < minimum || value > maximum)
+        {
+            throw new InvalidDataException(
+                $"Vegetation material '{materialGuid:D}' property '{property}' value " +
+                $"'{value}' must be finite and inside [{minimum}, {maximum}].");
+        }
+
+        return value;
+    }
+
+    private static Vector4 ResolveVector4(
+        MaterialAsset asset,
+        string property,
+        Vector4 defaultValue,
+        Guid materialGuid,
+        float minimum,
+        float maximum)
+    {
+        Vector4 value = defaultValue;
+        IReadOnlyList<MaterialVector4Property>? properties = asset.Vector4Properties;
+        if (properties != null)
+        {
+            for (int index = 0; index < properties.Count; index++)
+            {
+                if (string.Equals(properties[index].Name, property, StringComparison.OrdinalIgnoreCase))
+                {
+                    value = properties[index].Value;
+                    break;
+                }
+            }
+        }
+
+        if (!float.IsFinite(value.X) ||
+            !float.IsFinite(value.Y) ||
+            !float.IsFinite(value.Z) ||
+            !float.IsFinite(value.W) ||
+            value.X < minimum || value.X > maximum ||
+            value.Y < minimum || value.Y > maximum ||
+            value.Z < minimum || value.Z > maximum ||
+            value.W < minimum || value.W > maximum)
+        {
+            throw new InvalidDataException(
+                $"Vegetation material '{materialGuid:D}' property '{property}' value " +
+                $"'{value}' must have finite channels inside [{minimum}, {maximum}].");
+        }
+
+        return value;
+    }
+}
+
 [StructLayout(LayoutKind.Sequential)]
 internal readonly struct VegetationPreparedMaterialData
 {
+    public const uint InvalidImageIndex = 0xFFFFFFFFu;
+
     public readonly Vector4 BaseColorFactor;
+    public readonly float AlphaCutoff;
     public readonly float MetallicFactor;
     public readonly float RoughnessFactor;
+    public readonly float OcclusionStrength;
+    public readonly float TintVariation;
+    public readonly uint Flags;
     public readonly uint BaseColorImageIndex;
     public readonly uint BaseColorSamplerIndex;
+    public readonly uint NormalImageIndex;
+    public readonly uint NormalSamplerIndex;
+    public readonly uint OrmImageIndex;
+    public readonly uint OrmSamplerIndex;
 
     public VegetationPreparedMaterialData(
         Vector4 baseColorFactor,
+        float alphaCutoff,
         float metallicFactor,
         float roughnessFactor,
+        float occlusionStrength,
+        float tintVariation,
+        uint flags,
         uint baseColorImageIndex,
-        uint baseColorSamplerIndex)
+        uint baseColorSamplerIndex,
+        uint normalImageIndex,
+        uint normalSamplerIndex,
+        uint ormImageIndex,
+        uint ormSamplerIndex)
     {
         BaseColorFactor = baseColorFactor;
+        AlphaCutoff = alphaCutoff;
         MetallicFactor = metallicFactor;
         RoughnessFactor = roughnessFactor;
+        OcclusionStrength = occlusionStrength;
+        TintVariation = tintVariation;
+        Flags = flags;
         BaseColorImageIndex = baseColorImageIndex;
         BaseColorSamplerIndex = baseColorSamplerIndex;
+        NormalImageIndex = normalImageIndex;
+        NormalSamplerIndex = normalSamplerIndex;
+        OrmImageIndex = ormImageIndex;
+        OrmSamplerIndex = ormSamplerIndex;
+    }
+
+    public static VegetationPreparedMaterialData Create(
+        in VegetationMaterialSemantics semantics,
+        uint baseColorImageIndex,
+        uint baseColorSamplerIndex,
+        uint normalImageIndex,
+        uint normalSamplerIndex,
+        uint ormImageIndex,
+        uint ormSamplerIndex)
+    {
+        if (baseColorImageIndex == InvalidImageIndex ||
+            baseColorSamplerIndex == InvalidImageIndex ||
+            normalImageIndex == InvalidImageIndex ||
+            normalSamplerIndex == InvalidImageIndex ||
+            ormImageIndex == InvalidImageIndex ||
+            ormSamplerIndex == InvalidImageIndex)
+        {
+            throw new InvalidDataException(
+                "Vegetation prepared material is missing a bindless texture descriptor.");
+        }
+
+        return new VegetationPreparedMaterialData(
+            semantics.BaseColorFactor,
+            semantics.AlphaCutoff,
+            semantics.MetallicFactor,
+            semantics.RoughnessFactor,
+            semantics.OcclusionStrength,
+            semantics.TintVariation,
+            unchecked((uint)semantics.Flags),
+            baseColorImageIndex,
+            baseColorSamplerIndex,
+            normalImageIndex,
+            normalSamplerIndex,
+            ormImageIndex,
+            ormSamplerIndex);
     }
 }
 
@@ -171,6 +526,7 @@ internal readonly struct VegetationPreparedBatch
             lodLevel: 0,
             maximumDistance: float.MaxValue,
             maximumScreenError: float.MaxValue,
+            windStiffness: 0.0f,
             shadowPolicy,
             material)
     {
@@ -192,6 +548,7 @@ internal readonly struct VegetationPreparedBatch
         int lodLevel,
         float maximumDistance,
         float maximumScreenError,
+        float windStiffness,
         VegetationShadowPolicy shadowPolicy,
         in VegetationPreparedMaterialData material)
     {
@@ -210,6 +567,7 @@ internal readonly struct VegetationPreparedBatch
         LodLevel = lodLevel;
         MaximumDistance = maximumDistance;
         MaximumScreenError = maximumScreenError;
+        WindStiffness = windStiffness;
         ShadowPolicy = shadowPolicy;
         Material = material;
     }
@@ -229,8 +587,13 @@ internal readonly struct VegetationPreparedBatch
     public int LodLevel { get; }
     public float MaximumDistance { get; }
     public float MaximumScreenError { get; }
+    public float WindStiffness { get; }
     public VegetationShadowPolicy ShadowPolicy { get; }
     public VegetationPreparedMaterialData Material { get; }
+    public float ResolveFadeDistance() =>
+        float.IsFinite(MaximumDistance) && MaximumDistance > 0.0f
+            ? MaximumDistance
+            : 0.0f;
     public bool IsValid =>
         VertexBuffer.IsValid &&
         IndexBuffer.IsValid &&
@@ -240,6 +603,9 @@ internal readonly struct VegetationPreparedBatch
         MaximumDistance >= 0.0f &&
         float.IsFinite(MaximumScreenError) &&
         MaximumScreenError >= 0.0f &&
+        float.IsFinite(WindStiffness) &&
+        WindStiffness >= 0.0f &&
+        WindStiffness <= 1.0f &&
         InstanceBufferIndex != uint.MaxValue &&
         InstanceCount > 0;
 }

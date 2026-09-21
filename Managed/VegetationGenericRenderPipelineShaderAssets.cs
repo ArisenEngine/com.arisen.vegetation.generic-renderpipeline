@@ -27,7 +27,10 @@ internal static class VegetationGenericRenderPipelineShaderAssets
         return new ShaderAsset(
             VegetationShadowShaderGuid,
             "VegetationGenericRP/DirectionalShadow",
-            [new ShaderStageAsset("Vertex", EProgramStage.Vertex, "VSMain")],
+            [
+                new ShaderStageAsset("Vertex", EProgramStage.Vertex, "VSMain"),
+                new ShaderStageAsset("Fragment", EProgramStage.Fragment, "PSMain")
+            ],
             ShaderVariantKey.VulkanDebug);
     }
 

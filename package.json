@@ -23,7 +23,8 @@
       "ArisenEngine.Vegetation.IVegetationClusterDataSource",
       "ArisenEngine.Vegetation.IVegetationRuntimeDataStore",
       "ArisenEngine.Vegetation.IVegetationDiagnosticsPublisher",
-      "ArisenEngine.Vegetation.IVegetationAuthoringPreviewService"
+      "ArisenEngine.Vegetation.IVegetationAuthoringPreviewService",
+      "ArisenEngine.Vegetation.IVegetationWindSource"
     ]
   },
   "dependencies": {

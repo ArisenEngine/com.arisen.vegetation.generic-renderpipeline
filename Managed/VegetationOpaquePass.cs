@@ -13,15 +13,27 @@ namespace ArisenEngine.Vegetation.GenericRenderPipeline;
 [StructLayout(LayoutKind.Sequential)]
 internal readonly struct VegetationOpaqueFrameConstants
 {
-    public const int ByteSize = 112;
+    public const int ByteSize = 144;
 
+    /// <summary>
+    /// View-projection of the view frame: the render camera sits at the origin, so this matrix is
+    /// pure rotation plus projection and carries no world-origin translation.
+    /// </summary>
     public readonly Vector4 ViewProjectionColumn0;
     public readonly Vector4 ViewProjectionColumn1;
     public readonly Vector4 ViewProjectionColumn2;
     public readonly Vector4 ViewProjectionColumn3;
+    /// <summary>
+    /// Render-camera position expressed in this frame, i.e. the origin of every vertex position the
+    /// vegetation shaders read. Both vegetation passes render view-frame geometry, so they use this
+    /// record to measure camera distance and to resolve the view direction and shadow lookup
+    /// position without ever referring to the rebaseable world origin.
+    /// </summary>
     public readonly Vector4 CameraPosition;
     public readonly Vector4 LightDirectionIntensity;
     public readonly Vector4 LightColorAmbient;
+    public readonly Vector4 WindDirectionStrength;
+    public readonly Vector4 WindGustParameters;
 
     private VegetationOpaqueFrameConstants(
         Vector4 viewProjectionColumn0,
@@ -30,7 +42,9 @@ internal readonly struct VegetationOpaqueFrameConstants
         Vector4 viewProjectionColumn3,
         Vector4 cameraPosition,
         Vector4 lightDirectionIntensity,
-        Vector4 lightColorAmbient)
+        Vector4 lightColorAmbient,
+        Vector4 windDirectionStrength,
+        Vector4 windGustParameters)
     {
         ViewProjectionColumn0 = viewProjectionColumn0;
         ViewProjectionColumn1 = viewProjectionColumn1;
@@ -39,19 +53,29 @@ internal readonly struct VegetationOpaqueFrameConstants
         CameraPosition = cameraPosition;
         LightDirectionIntensity = lightDirectionIntensity;
         LightColorAmbient = lightColorAmbient;
+        WindDirectionStrength = windDirectionStrength;
+        WindGustParameters = windGustParameters;
     }
 
     public static VegetationOpaqueFrameConstants Create(
-        Matrix4x4 viewProjection,
-        Vector3 cameraPosition,
+        Matrix4x4 viewRelativeViewProjection,
+        Vector3 cameraPositionInFrame,
         DirectionalLight directionalLight,
-        SceneEnvironment environment)
+        SceneEnvironment environment,
+        in VegetationWindSettings wind,
+        WorldPosition frameAnchor)
     {
-        if (!IsFinite(cameraPosition))
+        if (!IsFinite(cameraPositionInFrame))
         {
             throw new ArgumentException(
-                "[Vegetation.GenericRP] Camera position is not finite.",
-                nameof(cameraPosition));
+                "[Vegetation.GenericRP] In-frame camera position is not finite.",
+                nameof(cameraPositionInFrame));
+        }
+        if (!wind.IsValid)
+        {
+            throw new ArgumentException(
+                "[Vegetation.GenericRP] Wind settings are outside their bounded range.",
+                nameof(wind));
         }
 
         DirectionalLight light = directionalLight.IsValid
@@ -63,30 +87,42 @@ internal readonly struct VegetationOpaqueFrameConstants
         float ambient = MathF.Max(
             MathF.Max(0.0f, light.AmbientIntensity),
             MathF.Max(0.0f, sceneEnvironment.AmbientIntensity));
+        (float primaryGustPhase, float secondaryGustPhase) =
+            wind.ResolveGustPhases(frameAnchor);
         return new VegetationOpaqueFrameConstants(
             new Vector4(
-                viewProjection.M11,
-                viewProjection.M21,
-                viewProjection.M31,
-                viewProjection.M41),
+                viewRelativeViewProjection.M11,
+                viewRelativeViewProjection.M21,
+                viewRelativeViewProjection.M31,
+                viewRelativeViewProjection.M41),
             new Vector4(
-                viewProjection.M12,
-                viewProjection.M22,
-                viewProjection.M32,
-                viewProjection.M42),
+                viewRelativeViewProjection.M12,
+                viewRelativeViewProjection.M22,
+                viewRelativeViewProjection.M32,
+                viewRelativeViewProjection.M42),
             new Vector4(
-                viewProjection.M13,
-                viewProjection.M23,
-                viewProjection.M33,
-                viewProjection.M43),
+                viewRelativeViewProjection.M13,
+                viewRelativeViewProjection.M23,
+                viewRelativeViewProjection.M33,
+                viewRelativeViewProjection.M43),
             new Vector4(
-                viewProjection.M14,
-                viewProjection.M24,
-                viewProjection.M34,
-                viewProjection.M44),
-            new Vector4(cameraPosition, 1.0f),
+                viewRelativeViewProjection.M14,
+                viewRelativeViewProjection.M24,
+                viewRelativeViewProjection.M34,
+                viewRelativeViewProjection.M44),
+            new Vector4(cameraPositionInFrame, 1.0f),
             new Vector4(light.Direction, light.Intensity),
-            new Vector4(light.Color, ambient));
+            new Vector4(light.Color, ambient),
+            new Vector4(
+                wind.Direction.X,
+                0.0f,
+                wind.Direction.Z,
+                wind.Strength),
+            new Vector4(
+                wind.GustAmplitude,
+                primaryGustPhase,
+                secondaryGustPhase,
+                wind.BendStrength));
     }
 
     private static bool IsFinite(Vector3 value) =>
@@ -99,23 +135,32 @@ internal readonly struct VegetationOpaqueFrameConstants
 internal readonly struct VegetationOpaqueDrawConstants
 {
     private const uint InvalidBindlessIndex = 0xFFFFFFFFu;
-    public const int ByteSize = 64;
+    public const int ByteSize = 112;
 
     public readonly Vector4 ClusterOriginInstanceBuffer;
     public readonly Vector4 BaseColorFactor;
     public readonly Vector4 MaterialParameters;
+    public readonly Vector4 NormalParameters;
+    public readonly Vector4 OrmParameters;
     public readonly Vector4 FrameShadowParameters;
+    public readonly Vector4 WindParameters;
 
     private VegetationOpaqueDrawConstants(
         Vector4 clusterOriginInstanceBuffer,
         Vector4 baseColorFactor,
         Vector4 materialParameters,
-        Vector4 frameShadowParameters)
+        Vector4 normalParameters,
+        Vector4 ormParameters,
+        Vector4 frameShadowParameters,
+        Vector4 windParameters)
     {
         ClusterOriginInstanceBuffer = clusterOriginInstanceBuffer;
         BaseColorFactor = baseColorFactor;
         MaterialParameters = materialParameters;
+        NormalParameters = normalParameters;
+        OrmParameters = ormParameters;
         FrameShadowParameters = frameShadowParameters;
+        WindParameters = windParameters;
     }
 
     public uint InstanceBufferIndex =>
@@ -126,8 +171,7 @@ internal readonly struct VegetationOpaqueDrawConstants
         BitConverter.SingleToUInt32Bits(FrameShadowParameters.Y);
 
     public static VegetationOpaqueDrawConstants Create(
-        WorldPosition renderOrigin,
-        WorldPosition clusterOrigin,
+        Vector3 viewRelativeClusterOrigin,
         in VegetationPreparedBatch batch,
         uint frameBufferIndex,
         bool receiveShadows,
@@ -146,7 +190,6 @@ internal readonly struct VegetationOpaqueDrawConstants
                 "[Vegetation.GenericRP] Opaque frame buffer is not bindless-addressable.");
         }
 
-        Vector3 relativeClusterOrigin = ToRelativeFloat(clusterOrigin, renderOrigin);
         uint shadowBufferIndex = receiveShadows && directionalShadow.Enabled
             ? directionalShadow.ConstantsBufferBindlessIndex
             : InvalidBindlessIndex;
@@ -154,40 +197,38 @@ internal readonly struct VegetationOpaqueDrawConstants
 
         return new VegetationOpaqueDrawConstants(
             new Vector4(
-                relativeClusterOrigin,
+                viewRelativeClusterOrigin,
                 BitConverter.UInt32BitsToSingle(batch.InstanceBufferIndex)),
-            material.BaseColorFactor,
+            new Vector4(
+                material.BaseColorFactor.X,
+                material.BaseColorFactor.Y,
+                material.BaseColorFactor.Z,
+                material.AlphaCutoff),
             new Vector4(
                 material.MetallicFactor,
                 material.RoughnessFactor,
                 BitConverter.UInt32BitsToSingle(material.BaseColorImageIndex),
                 BitConverter.UInt32BitsToSingle(material.BaseColorSamplerIndex)),
             new Vector4(
+                BitConverter.UInt32BitsToSingle(material.NormalImageIndex),
+                BitConverter.UInt32BitsToSingle(material.NormalSamplerIndex),
+                material.TintVariation,
+                material.BaseColorFactor.W),
+            new Vector4(
+                BitConverter.UInt32BitsToSingle(material.OrmImageIndex),
+                BitConverter.UInt32BitsToSingle(material.OrmSamplerIndex),
+                material.OcclusionStrength,
+                0.0f),
+            new Vector4(
                 BitConverter.UInt32BitsToSingle(frameBufferIndex),
                 BitConverter.UInt32BitsToSingle(shadowBufferIndex),
+                BitConverter.UInt32BitsToSingle(material.Flags),
+                0.0f),
+            new Vector4(
+                batch.WindStiffness,
+                batch.ResolveFadeDistance(),
                 0.0f,
                 0.0f));
-    }
-
-    private static Vector3 ToRelativeFloat(
-        WorldPosition worldPosition,
-        WorldPosition renderOrigin)
-    {
-        double x = worldPosition.X - renderOrigin.X;
-        double y = worldPosition.Y - renderOrigin.Y;
-        double z = worldPosition.Z - renderOrigin.Z;
-        if (!double.IsFinite(x) ||
-            !double.IsFinite(y) ||
-            !double.IsFinite(z) ||
-            Math.Abs(x) > float.MaxValue ||
-            Math.Abs(y) > float.MaxValue ||
-            Math.Abs(z) > float.MaxValue)
-        {
-            throw new InvalidOperationException(
-                "[Vegetation.GenericRP] Cluster is outside the origin-relative float range.");
-        }
-
-        return new Vector3((float)x, (float)y, (float)z);
     }
 }
 
@@ -295,6 +336,13 @@ internal sealed class VegetationOpaquePass : RenderPassNode
 
     public int LastRecordedBatchCount => Volatile.Read(ref m_LastRecordedBatchCount);
     public long LastRecordedInstanceCount => Volatile.Read(ref m_LastRecordedInstanceCount);
+
+    /// <summary>
+    /// Frame-global vegetation constants written by <see cref="PrepareFrame"/>. The vegetation
+    /// shadow pass reads the same records to reproduce the opaque displacement and fade exactly,
+    /// so it needs the handle to publish its own host-write to shader-read dependency.
+    /// </summary>
+    public RHIBufferHandle FrameConstantsBuffer => m_FrameConstantsBuffer;
 
     public static void DeclareGraphAccess(
         RenderGraphBuilder builder,
@@ -431,10 +479,12 @@ internal sealed class VegetationOpaquePass : RenderPassNode
 
     public unsafe uint PrepareFrame(
         RenderContext context,
-        Matrix4x4 viewProjection,
-        Vector3 cameraPosition,
+        Matrix4x4 viewRelativeViewProjection,
+        Vector3 cameraPositionInFrame,
         DirectionalLight directionalLight,
-        SceneEnvironment environment)
+        SceneEnvironment environment,
+        in VegetationWindSettings wind,
+        WorldPosition frameAnchor)
     {
         if (sizeof(VegetationOpaqueFrameConstants) !=
                 VegetationOpaqueFrameConstants.ByteSize ||
@@ -460,10 +510,12 @@ internal sealed class VegetationOpaquePass : RenderPassNode
 
         VegetationOpaqueFrameConstants constants =
             VegetationOpaqueFrameConstants.Create(
-                viewProjection,
-                cameraPosition,
+                viewRelativeViewProjection,
+                cameraPositionInFrame,
                 directionalLight,
-                environment);
+                environment,
+                wind,
+                frameAnchor);
         IntPtr mapped = m_Factory.MapBuffer(slot.Buffer);
         if (mapped == IntPtr.Zero)
         {
@@ -919,6 +971,11 @@ internal sealed class VegetationOpaquePass : RenderPassNode
             0,
             EFormat.FORMAT_R32G32B32_SFLOAT,
             12);
+        state.AddVertexInputAttributeDescription(
+            2,
+            0,
+            EFormat.FORMAT_R32G32B32A32_SFLOAT,
+            24);
         state.AddVertexInputAttributeDescription(
             3,
             0,

@@ -568,6 +568,7 @@ internal sealed class VegetationGpuResourceFactory : IVegetationClusterGpuResour
                         lodIndex,
                         lod.MaximumDistance,
                         lod.MaximumScreenError,
+                        first.Species.WindResponse,
                         first.Species.ShadowPolicy,
                         materialData));
                 }
@@ -585,46 +586,23 @@ internal sealed class VegetationGpuResourceFactory : IVegetationClusterGpuResour
         RHIMaterialResource material,
         Guid materialGuid)
     {
-        MaterialRenderState state = material.RenderState;
-        if (state.BlendEnabled ||
-            state.CullMode != ECullModeFlagBits.CULL_MODE_NONE ||
-            state.FrontFace != EFrontFace.FRONT_FACE_COUNTER_CLOCKWISE)
-        {
-            throw new NotSupportedException(
-                $"Vegetation material '{materialGuid:D}' must use the Item 5 opaque, " +
-                "two-sided, counter-clockwise render-state contract.");
-        }
-        if (!material.TryGetTexture2DConstants(
-                MaterialTextureSlots.BaseColor,
-                out MaterialTexture2DBindlessConstants baseColor))
-        {
-            throw new NotSupportedException(
-                $"Vegetation material '{materialGuid:D}' must provide a BaseColor texture.");
-        }
-
-        Vector4 baseColorFactor = material.GetVector4PropertyOrDefault(
-            MaterialPropertySlots.BaseColorFactor,
-            Vector4.One);
-        float metallic = material.GetScalarPropertyOrDefault(
-            MaterialPropertySlots.MetallicFactor,
-            0.0f);
-        float roughness = material.GetScalarPropertyOrDefault(
-            MaterialPropertySlots.RoughnessFactor,
-            1.0f);
-        if (!IsFinite(baseColorFactor) ||
-            !float.IsFinite(metallic) ||
-            !float.IsFinite(roughness))
-        {
-            throw new InvalidDataException(
-                $"Vegetation material '{materialGuid:D}' contains non-finite PBR values.");
-        }
-
-        return new VegetationPreparedMaterialData(
-            baseColorFactor,
-            Math.Clamp(metallic, 0.0f, 1.0f),
-            Math.Clamp(roughness, 0.04f, 1.0f),
+        VegetationMaterialSemantics semantics = VegetationMaterialContract.Resolve(
+            material.Asset,
+            materialGuid);
+        MaterialTexture2DBindlessConstants baseColor = material.GetTexture2DConstants(
+            MaterialTextureSlots.BaseColor);
+        MaterialTexture2DBindlessConstants normal = material.GetTexture2DConstants(
+            MaterialTextureSlots.Normal);
+        MaterialTexture2DBindlessConstants orm = material.GetTexture2DConstants(
+            MaterialTextureSlots.MetallicRoughness);
+        return VegetationPreparedMaterialData.Create(
+            semantics,
             baseColor.ImageIndex,
-            baseColor.SamplerIndex);
+            baseColor.SamplerIndex,
+            normal.ImageIndex,
+            normal.SamplerIndex,
+            orm.ImageIndex,
+            orm.SamplerIndex);
     }
 
     private static InstanceBuildRecord[] BuildRecords(
@@ -808,6 +786,7 @@ internal sealed class VegetationGpuResourceFactory : IVegetationClusterGpuResour
             int lodLevel,
             float maximumDistance,
             float maximumScreenError,
+            float windStiffness,
             VegetationShadowPolicy shadowPolicy,
             in VegetationPreparedMaterialData material)
         {
@@ -825,6 +804,7 @@ internal sealed class VegetationGpuResourceFactory : IVegetationClusterGpuResour
             LodLevel = lodLevel;
             MaximumDistance = maximumDistance;
             MaximumScreenError = maximumScreenError;
+            WindStiffness = windStiffness;
             ShadowPolicy = shadowPolicy;
             Material = material;
         }
@@ -843,6 +823,7 @@ internal sealed class VegetationGpuResourceFactory : IVegetationClusterGpuResour
         public int LodLevel { get; }
         public float MaximumDistance { get; }
         public float MaximumScreenError { get; }
+        public float WindStiffness { get; }
         public VegetationShadowPolicy ShadowPolicy { get; }
         public VegetationPreparedMaterialData Material { get; }
 
@@ -862,6 +843,7 @@ internal sealed class VegetationGpuResourceFactory : IVegetationClusterGpuResour
             LodLevel,
             MaximumDistance,
             MaximumScreenError,
+            WindStiffness,
             ShadowPolicy,
             Material);
     }

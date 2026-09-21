@@ -14,35 +14,58 @@ namespace ArisenEngine.Vegetation.GenericRenderPipeline;
 [StructLayout(LayoutKind.Sequential)]
 internal readonly struct VegetationShadowDrawConstants
 {
+    public const int ByteSize = 112;
+
     public readonly Vector4 ViewProjectionColumn0;
     public readonly Vector4 ViewProjectionColumn1;
     public readonly Vector4 ViewProjectionColumn2;
     public readonly Vector4 ViewProjectionColumn3;
     public readonly Vector4 ClusterOriginInstanceBuffer;
+    public readonly Vector4 MaterialParameters;
+    public readonly Vector4 MaterialFlags;
 
     private VegetationShadowDrawConstants(
         Vector4 viewProjectionColumn0,
         Vector4 viewProjectionColumn1,
         Vector4 viewProjectionColumn2,
         Vector4 viewProjectionColumn3,
-        Vector4 clusterOriginInstanceBuffer)
+        Vector4 clusterOriginInstanceBuffer,
+        Vector4 materialParameters,
+        Vector4 materialFlags)
     {
         ViewProjectionColumn0 = viewProjectionColumn0;
         ViewProjectionColumn1 = viewProjectionColumn1;
         ViewProjectionColumn2 = viewProjectionColumn2;
         ViewProjectionColumn3 = viewProjectionColumn3;
         ClusterOriginInstanceBuffer = clusterOriginInstanceBuffer;
+        MaterialParameters = materialParameters;
+        MaterialFlags = materialFlags;
     }
 
     public uint InstanceBufferIndex =>
         BitConverter.SingleToUInt32Bits(ClusterOriginInstanceBuffer.W);
 
+    public uint BaseColorImageIndex =>
+        BitConverter.SingleToUInt32Bits(MaterialParameters.Y);
+
+    public uint BaseColorSamplerIndex =>
+        BitConverter.SingleToUInt32Bits(MaterialParameters.Z);
+
+    public uint MaterialFlagBits =>
+        BitConverter.SingleToUInt32Bits(MaterialFlags.X);
+
+    public float WindStiffness => MaterialFlags.Y;
+
+    public float FadeDistance => MaterialFlags.Z;
+
+    public uint FrameBufferIndex =>
+        BitConverter.SingleToUInt32Bits(MaterialFlags.W);
+
     public static VegetationShadowDrawConstants Create(
         in DirectionalShadowCascade cascade,
-        Vector3 shadowCameraPosition,
-        WorldPosition renderOrigin,
-        WorldPosition clusterOrigin,
-        in VegetationPreparedBatch batch)
+        Vector3 viewRelativeClusterOrigin,
+        in VegetationPreparedBatch batch,
+        uint frameBufferIndex)
     {
         if (!batch.IsValid || batch.ShadowPolicy != VegetationShadowPolicy.Cast)
         {
@@ -50,16 +73,14 @@ internal readonly struct VegetationShadowDrawConstants
                 "[Vegetation.GenericRP] Cannot prepare a non-casting shadow batch.",
                 nameof(batch));
         }
-        if (!IsFinite(shadowCameraPosition))
+        if (frameBufferIndex == uint.MaxValue)
         {
-            throw new ArgumentException(
-                "[Vegetation.GenericRP] Shadow camera position is not finite.",
-                nameof(shadowCameraPosition));
+            throw new ArgumentOutOfRangeException(
+                nameof(frameBufferIndex),
+                "[Vegetation.GenericRP] Shadow draws require the vegetation wind frame buffer.");
         }
-
-        Vector3 relativeClusterOrigin =
-            ToRelativeFloat(clusterOrigin, renderOrigin) - shadowCameraPosition;
         Matrix4x4 viewProjection = cascade.ViewProjection;
+        VegetationPreparedMaterialData material = batch.Material;
         return new VegetationShadowDrawConstants(
             new Vector4(
                 viewProjection.M11,
@@ -82,35 +103,19 @@ internal readonly struct VegetationShadowDrawConstants
                 viewProjection.M34,
                 viewProjection.M44),
             new Vector4(
-                relativeClusterOrigin,
-                BitConverter.UInt32BitsToSingle(batch.InstanceBufferIndex)));
+                viewRelativeClusterOrigin,
+                BitConverter.UInt32BitsToSingle(batch.InstanceBufferIndex)),
+            new Vector4(
+                material.AlphaCutoff,
+                BitConverter.UInt32BitsToSingle(material.BaseColorImageIndex),
+                BitConverter.UInt32BitsToSingle(material.BaseColorSamplerIndex),
+                material.BaseColorFactor.W),
+            new Vector4(
+                BitConverter.UInt32BitsToSingle(material.Flags),
+                batch.WindStiffness,
+                batch.ResolveFadeDistance(),
+                BitConverter.UInt32BitsToSingle(frameBufferIndex)));
     }
-
-    private static Vector3 ToRelativeFloat(
-        WorldPosition worldPosition,
-        WorldPosition renderOrigin)
-    {
-        double x = worldPosition.X - renderOrigin.X;
-        double y = worldPosition.Y - renderOrigin.Y;
-        double z = worldPosition.Z - renderOrigin.Z;
-        if (!double.IsFinite(x) ||
-            !double.IsFinite(y) ||
-            !double.IsFinite(z) ||
-            Math.Abs(x) > float.MaxValue ||
-            Math.Abs(y) > float.MaxValue ||
-            Math.Abs(z) > float.MaxValue)
-        {
-            throw new InvalidOperationException(
-                "[Vegetation.GenericRP] Shadow cluster is outside the origin-relative float range.");
-        }
-
-        return new Vector3((float)x, (float)y, (float)z);
-    }
-
-    private static bool IsFinite(Vector3 value) =>
-        float.IsFinite(value.X) &&
-        float.IsFinite(value.Y) &&
-        float.IsFinite(value.Z);
 }
 
 internal readonly struct VegetationShadowPreparedDraw
@@ -163,12 +168,15 @@ internal sealed class VegetationShadowPass : RenderPassNode
 {
     private const ulong DynamicViewportScissorMask = 0x1UL | 0x2UL;
     private const string VertexStage = "Vertex";
+    private const string FragmentStage = "Fragment";
     private const float RasterDepthBiasConstantFactor = 1.25f;
     private const float RasterDepthBiasSlopeFactor = 1.75f;
     private const int PipelineCleanupLeg = 0;
     private const int PipelineStateCleanupLeg = 1;
     private const int VertexProgramCleanupLeg = 2;
     private const int VertexShaderAssetCleanupLeg = 3;
+    private const int FragmentProgramCleanupLeg = 4;
+    private const int FragmentShaderAssetCleanupLeg = 5;
 
     private readonly IAssetDatabase m_AssetDatabase;
     private readonly ShaderAsset m_Shader;
@@ -186,12 +194,15 @@ internal sealed class VegetationShadowPass : RenderPassNode
     private RHIPipelineState m_PipelineState;
     private RHIPipelineHandle m_Pipeline = RHIPipelineHandle.Invalid;
     private RHIShaderProgramHandle m_VertexProgram = RHIShaderProgramHandle.Invalid;
+    private RHIShaderProgramHandle m_FragmentProgram = RHIShaderProgramHandle.Invalid;
     private CookedAssetHandle m_VertexShaderAsset = CookedAssetHandle.Invalid;
+    private CookedAssetHandle m_FragmentShaderAsset = CookedAssetHandle.Invalid;
     private AssetDependencyStamp m_ShaderStamp = AssetDependencyStamp.Empty;
     private EFormat m_DepthFormat = EFormat.FORMAT_UNDEFINED;
     private uint m_Width;
     private uint m_Height;
     private VegetationPassCleanupJournal m_PipelineCleanup;
+    private RHIBufferHandle m_FrameDataBuffer = RHIBufferHandle.Invalid;
 
     public VegetationShadowPass(IAssetDatabase assetDatabase)
         : base("VegetationDirectionalShadowPass")
@@ -202,6 +213,17 @@ internal sealed class VegetationShadowPass : RenderPassNode
 
     public int LastRecordedBatchCount => Volatile.Read(ref m_LastRecordedBatchCount);
     public long LastRecordedInstanceCount => Volatile.Read(ref m_LastRecordedInstanceCount);
+
+    /// <summary>
+    /// Declares the host-written vegetation frame constants that the shadow draw constants point
+    /// at. The shadow vertex shader reproduces the opaque displacement and fade from those same
+    /// records, so this pass has to publish its own host-write to shader-read dependency instead of
+    /// relying on the opaque pass having published one earlier in the queue.
+    /// </summary>
+    public void SetFrameDataBuffer(RHIBufferHandle buffer)
+    {
+        m_FrameDataBuffer = buffer;
+    }
 
     public static void DeclareGraphAccess(
         RenderGraphBuilder builder,
@@ -281,9 +303,17 @@ internal sealed class VegetationShadowPass : RenderPassNode
         m_PipelineCache = pipelineCache;
         try
         {
-            m_VertexProgram = CompileProgram(out m_VertexShaderAsset);
+            m_VertexProgram = CompileProgram(
+                EShaderStage.SHADER_STAGE_VERTEX_BIT,
+                VertexStage,
+                out m_VertexShaderAsset);
+            m_FragmentProgram = CompileProgram(
+                EShaderStage.SHADER_STAGE_FRAGMENT_BIT,
+                FragmentStage,
+                out m_FragmentShaderAsset);
             m_PipelineState = pipelineCache.GetPipelineState();
             m_PipelineState.AddProgram(m_VertexProgram);
+            m_PipelineState.AddProgram(m_FragmentProgram);
             m_PipelineState.SetBindPoint(
                 EPipelineBindPoint.PIPELINE_BIND_POINT_GRAPHICS);
             m_PipelineState.SetInputAssemblyState(
@@ -408,6 +438,7 @@ internal sealed class VegetationShadowPass : RenderPassNode
         int drawEnd = checked(drawStart + drawCount);
         int recordedBatches = 0;
         long recordedInstances = 0;
+        RecordFrameDataBarrier(commandList);
         commandList.BeginRenderingDepthOnly(
             m_DepthTargets[cascadeIndex],
             EImageLayout.IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
@@ -435,7 +466,8 @@ internal sealed class VegetationShadowPass : RenderPassNode
 
             commandList.PushConstants(
                 draw.Constants,
-                EShaderStage.SHADER_STAGE_VERTEX_BIT);
+                EShaderStage.SHADER_STAGE_VERTEX_BIT |
+                EShaderStage.SHADER_STAGE_FRAGMENT_BIT);
             commandList.BindVertexBuffers(draw.VertexBuffer);
             commandList.BindIndexBuffer(
                 draw.IndexBuffer,
@@ -463,6 +495,8 @@ internal sealed class VegetationShadowPass : RenderPassNode
         m_PipelineCleanup.Release(PipelineStateCleanupLeg, ReleasePipelineState);
         m_PipelineCleanup.Release(VertexProgramCleanupLeg, ReleaseVertexProgram);
         m_PipelineCleanup.Release(VertexShaderAssetCleanupLeg, ReleaseVertexShaderAsset);
+        m_PipelineCleanup.Release(FragmentProgramCleanupLeg, ReleaseFragmentProgram);
+        m_PipelineCleanup.Release(FragmentShaderAssetCleanupLeg, ReleaseFragmentShaderAsset);
 
         m_PipelineCache = null;
         m_ShaderStamp = AssetDependencyStamp.Empty;
@@ -472,8 +506,35 @@ internal sealed class VegetationShadowPass : RenderPassNode
         m_Height = 0;
         Volatile.Write(ref m_LastRecordedBatchCount, 0);
         Volatile.Write(ref m_LastRecordedInstanceCount, 0);
+        m_FrameDataBuffer = RHIBufferHandle.Invalid;
         m_Factory = default;
         m_Device = default;
+    }
+
+    private void RecordFrameDataBarrier(RenderCommandList commandList)
+    {
+        if (!m_FrameDataBuffer.IsValid)
+        {
+            return;
+        }
+
+        Span<RHIBufferMemoryBarrier> barriers = stackalloc RHIBufferMemoryBarrier[1];
+        barriers[0] = new RHIBufferMemoryBarrier
+        {
+            SrcAccessMask = EAccessFlag.ACCESS_HOST_WRITE_BIT,
+            DstAccessMask = EAccessFlag.ACCESS_SHADER_READ_BIT,
+            SrcQueueFamilyIndex = RHIQueueFamily.Ignored,
+            DstQueueFamilyIndex = RHIQueueFamily.Ignored,
+            Buffer = m_FrameDataBuffer,
+            SrcStageMask = EPipelineStageFlagBits.PIPELINE_STAGE_HOST_BIT,
+            DstStageMask = EPipelineStageFlagBits.PIPELINE_STAGE_VERTEX_SHADER_BIT |
+                           EPipelineStageFlagBits.PIPELINE_STAGE_FRAGMENT_SHADER_BIT
+        };
+        commandList.PipelineBarrier(
+            EPipelineStageFlagBits.PIPELINE_STAGE_HOST_BIT,
+            EPipelineStageFlagBits.PIPELINE_STAGE_VERTEX_SHADER_BIT |
+            EPipelineStageFlagBits.PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+            barriers);
     }
 
     private void ReleasePipeline()
@@ -528,7 +589,36 @@ internal sealed class VegetationShadowPass : RenderPassNode
         m_VertexShaderAsset = CookedAssetHandle.Invalid;
     }
 
+    private void ReleaseFragmentProgram()
+    {
+        if (!m_FragmentProgram.IsValid)
+        {
+            return;
+        }
+        if (!m_Factory.IsValid)
+        {
+            throw new InvalidOperationException(
+                "[Vegetation.GenericRP] Cannot release the shadow fragment program without its factory.");
+        }
+
+        m_Factory.ReleaseGPUProgram(m_FragmentProgram);
+        m_FragmentProgram = RHIShaderProgramHandle.Invalid;
+    }
+
+    private void ReleaseFragmentShaderAsset()
+    {
+        if (!m_FragmentShaderAsset.IsValid)
+        {
+            return;
+        }
+
+        m_AssetDatabase.Release(m_FragmentShaderAsset);
+        m_FragmentShaderAsset = CookedAssetHandle.Invalid;
+    }
+
     private RHIShaderProgramHandle CompileProgram(
+        EShaderStage rhiStage,
+        string stageName,
         out CookedAssetHandle shaderAssetHandle)
     {
         shaderAssetHandle = CookedAssetHandle.Invalid;
@@ -538,7 +628,7 @@ internal sealed class VegetationShadowPass : RenderPassNode
             CookedShaderStage cookedStage = ShaderAssetCooker.LoadOrCookStage(
                 m_AssetDatabase,
                 m_Shader,
-                VertexStage);
+                stageName);
             shaderAssetHandle = cookedStage.Handle;
             ReadOnlyMemory<byte> shaderCode =
                 m_AssetDatabase.GetCookedAssetBytes(shaderAssetHandle);
@@ -546,12 +636,12 @@ internal sealed class VegetationShadowPass : RenderPassNode
             if (!program.IsValid ||
                 !m_Factory.AttachProgramByteCode(
                     program,
-                    EShaderStage.SHADER_STAGE_VERTEX_BIT,
+                    rhiStage,
                     shaderCode,
                     cookedStage.Stage.EntryPoint))
             {
                 throw new InvalidOperationException(
-                    "[Vegetation.GenericRP] Failed to prepare vegetation shadow shader.");
+                    $"[Vegetation.GenericRP] Failed to prepare vegetation shadow shader stage '{stageName}'.");
             }
 
             return program;
@@ -583,5 +673,10 @@ internal sealed class VegetationShadowPass : RenderPassNode
             0,
             EFormat.FORMAT_R32G32B32_SFLOAT,
             0);
+        state.AddVertexInputAttributeDescription(
+            1,
+            0,
+            EFormat.FORMAT_R32G32_SFLOAT,
+            40);
     }
 }

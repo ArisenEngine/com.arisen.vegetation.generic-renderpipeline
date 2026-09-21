@@ -49,13 +49,30 @@ public sealed class VegetationGenericRenderPipelinePackage : IPackageEntry
         try
         {
             IAssetDatabase assetDatabase = services.GetService<IAssetDatabase>();
-            VegetationRenderValidationMode validationMode =
+            VegetationRenderValidationSelection validation =
                 VegetationRenderValidationPolicy.ResolveFromEnvironment();
-            if (validationMode != VegetationRenderValidationMode.Full)
+            if (validation.Mode != VegetationRenderValidationMode.Full)
             {
                 KernelLog.InfoFormat(
                     "[Vegetation.GenericRP.VisualValidation] Mode={0}",
-                    validationMode);
+                    validation.Mode);
+            }
+            if (validation.PinsWindClock)
+            {
+                if (!services.TryGetService<IVegetationWindClockControl>(out var windClock))
+                {
+                    throw new InvalidOperationException(
+                        "Vegetation visual validation requires the vegetation package to " +
+                        "register IVegetationWindClockControl so that every comparison process " +
+                        "renders the same wind pose.");
+                }
+
+                windClock.SetTimeSeconds(
+                    VegetationRenderValidationPolicy.ComparableWindTimeSeconds);
+                KernelLog.InfoFormat(
+                    "[Vegetation.GenericRP.VisualValidation] Wind clock pinned at {0:F3}s for " +
+                    "cross-process comparison.",
+                    VegetationRenderValidationPolicy.ComparableWindTimeSeconds);
             }
             var gpuResources = new VegetationGpuResourceFactory(
                 services.GetService<IGenericRenderPipelinePreparedAssetSource>());
@@ -70,10 +87,11 @@ public sealed class VegetationGenericRenderPipelinePackage : IPackageEntry
                 services.GetService<IVegetationClusterDataSource>(),
                 services.GetService<IVegetationDiagnosticsPublisher>(),
                 services.GetService<IVegetationAuthoringPreviewService>(),
+                services.GetService<IVegetationWindSource>(),
                 m_PreparedAssets,
                 new VegetationOpaquePass(assetDatabase),
                 new VegetationShadowPass(assetDatabase),
-                validationMode,
+                validation.Mode,
                 services.GetService<ITaskGraph>());
 
             m_ShaderRegistry.RegisterRuntimeShaders(

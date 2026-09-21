@@ -11,11 +11,13 @@ internal sealed class VegetationGenericRenderPipelineFeature : IGenericRenderPip
 {
     public const string Id = "com.arisen.vegetation.generic-renderpipeline";
     private const int ReportedSurfaceCapacity = 8;
+    private const int MaximumLoggedClusters = 8;
 
     private readonly IVegetationClusterRenderSource m_RenderSource;
     private readonly IVegetationClusterDataSource m_ClusterData;
     private readonly IVegetationDiagnosticsPublisher m_Diagnostics;
     private readonly IVegetationAuthoringPreviewService m_AuthoringPreviews;
+    private readonly IVegetationWindSource m_WindSource;
     private readonly VegetationPreparedAssetProvider m_PreparedAssets;
     private readonly VegetationOpaquePass m_OpaquePass;
     private readonly VegetationShadowPass m_ShadowPass;
@@ -34,6 +36,10 @@ internal sealed class VegetationGenericRenderPipelineFeature : IGenericRenderPip
         Array.Empty<VegetationShadowPreparedDraw>();
     private readonly ReportedSurfaceGeneration[] m_ReportedSurfaces =
         new ReportedSurfaceGeneration[ReportedSurfaceCapacity];
+    private readonly Guid[] m_LoggedClusterGuids = new Guid[MaximumLoggedClusters];
+    private readonly Guid[] m_LoggedSpeciesGuids = new Guid[MaximumLoggedClusters];
+    private readonly long[] m_LoggedClusterInstances = new long[MaximumLoggedClusters];
+    private readonly System.Text.StringBuilder m_LoggedClusterList = new();
     private VegetationClusterDataSnapshot m_RuntimeSnapshot =
         VegetationClusterDataSnapshot.Empty;
     private VegetationAuthoringPreviewSnapshot m_PreviewSnapshot =
@@ -62,6 +68,7 @@ internal sealed class VegetationGenericRenderPipelineFeature : IGenericRenderPip
         IVegetationClusterDataSource clusterData,
         IVegetationDiagnosticsPublisher diagnostics,
         IVegetationAuthoringPreviewService authoringPreviews,
+        IVegetationWindSource windSource,
         VegetationPreparedAssetProvider preparedAssets,
         VegetationOpaquePass opaquePass,
         VegetationShadowPass shadowPass,
@@ -73,6 +80,7 @@ internal sealed class VegetationGenericRenderPipelineFeature : IGenericRenderPip
         m_Diagnostics = diagnostics ?? throw new ArgumentNullException(nameof(diagnostics));
         m_AuthoringPreviews = authoringPreviews
             ?? throw new ArgumentNullException(nameof(authoringPreviews));
+        m_WindSource = windSource ?? throw new ArgumentNullException(nameof(windSource));
         m_PreparedAssets = preparedAssets
             ?? throw new ArgumentNullException(nameof(preparedAssets));
         m_OpaquePass = opaquePass ?? throw new ArgumentNullException(nameof(opaquePass));
@@ -87,6 +95,12 @@ internal sealed class VegetationGenericRenderPipelineFeature : IGenericRenderPip
     public string FeatureId => Id;
 
     public int Order => 200;
+
+    /// <summary>
+    /// Every vertex position the vegetation passes consume is relative to the render camera, so the
+    /// camera sits exactly at the origin of the frame those passes render in.
+    /// </summary>
+    private static Vector3 ViewFrameCameraPosition => Vector3.Zero;
 
     public void ConsumeExtractedFrame(in GenericRenderPipelineFeatureFrameContext context)
     {
@@ -128,18 +142,37 @@ internal sealed class VegetationGenericRenderPipelineFeature : IGenericRenderPip
         }
 
         m_OpaquePass.Prepare(context.RenderContext);
+        if (!TryResolveCameraWorldPosition(context, out WorldPosition cameraWorldPosition))
+        {
+            ClearPreparedFrameState(
+                context.DirectionalShadow.Cascades.Count,
+                droppedDrawCount: 0);
+            m_DeviceResourcesReleased = false;
+            PlotPreparedState();
+            return;
+        }
+
+        VegetationWindSettings wind = m_WindSource.Current;
         uint opaqueFrameBufferIndex = m_OpaquePass.PrepareFrame(
             context.RenderContext,
-            context.ViewProjection,
-            context.CameraPosition,
+            context.ViewRelativeViewProjection,
+            ViewFrameCameraPosition,
             context.DirectionalLight,
-            context.SceneEnvironment);
+            context.SceneEnvironment,
+            wind,
+            cameraWorldPosition);
         m_ShadowPass.Prepare(context.RenderContext);
 
-        PrepareClustersAndOpaqueDraws(context, opaqueFrameBufferIndex);
+        PrepareClustersAndOpaqueDraws(
+            context,
+            opaqueFrameBufferIndex,
+            cameraWorldPosition);
         if (m_ValidationMode == VegetationRenderValidationMode.Full)
         {
-            PrepareShadowDraws(context);
+            PrepareShadowDraws(
+                context,
+                opaqueFrameBufferIndex,
+                cameraWorldPosition);
         }
         else
         {
@@ -285,7 +318,8 @@ internal sealed class VegetationGenericRenderPipelineFeature : IGenericRenderPip
 
     private void PrepareClustersAndOpaqueDraws(
         in GenericRenderPipelineFeatureFrameContext context,
-        uint frameBufferIndex)
+        uint frameBufferIndex,
+        WorldPosition cameraWorldPosition)
     {
         m_PreparedClusterCount = 0;
         m_OpaqueDrawCount = 0;
@@ -363,8 +397,9 @@ internal sealed class VegetationGenericRenderPipelineFeature : IGenericRenderPip
                         checked(m_OpaqueDrawCount + 1));
                     VegetationOpaqueDrawConstants constants =
                         VegetationOpaqueDrawConstants.Create(
-                            context.RenderContext.RenderOrigin,
-                            cluster.Prepared.Origin,
+                            VegetationViewFrame.ToViewRelativePosition(
+                                cluster.Prepared.Origin,
+                                cameraWorldPosition),
                             batch,
                             frameBufferIndex,
                             receiveShadows,
@@ -430,10 +465,13 @@ internal sealed class VegetationGenericRenderPipelineFeature : IGenericRenderPip
     }
 
     private void PrepareShadowDraws(
-        in GenericRenderPipelineFeatureFrameContext context)
+        in GenericRenderPipelineFeatureFrameContext context,
+        uint opaqueFrameBufferIndex,
+        WorldPosition cameraWorldPosition)
     {
         m_ShadowDrawCount = 0;
         DirectionalShadowFrameData shadow = context.DirectionalShadow;
+        m_ShadowPass.SetFrameDataBuffer(m_OpaquePass.FrameConstantsBuffer);
         int cascadeCount = shadow.Cascades.Count;
         if (!shadow.Enabled || cascadeCount <= 0)
         {
@@ -479,10 +517,11 @@ internal sealed class VegetationGenericRenderPipelineFeature : IGenericRenderPip
                     VegetationShadowDrawConstants constants =
                         VegetationShadowDrawConstants.Create(
                             cascade,
-                            shadow.Cascades.CameraPosition,
-                            context.RenderContext.RenderOrigin,
-                            cluster.Prepared.Origin,
-                            batch);
+                            VegetationViewFrame.ToViewRelativePosition(
+                                cluster.Prepared.Origin,
+                                cameraWorldPosition),
+                            batch,
+                            opaqueFrameBufferIndex);
                     m_ShadowDraws[m_ShadowDrawCount++] =
                         new VegetationShadowPreparedDraw(batch, constants);
                 }
@@ -510,20 +549,15 @@ internal sealed class VegetationGenericRenderPipelineFeature : IGenericRenderPip
     private static VegetationCullingView CreateCullingView(
         in GenericRenderPipelineFeatureFrameContext context)
     {
-        if (context.Snapshot.CameraCount == 0)
+        if (!TryResolveCameraWorldPosition(context, out WorldPosition cameraWorldPosition))
         {
             return default;
         }
 
         Camera camera = context.Snapshot.Cameras[0];
-        WorldPosition renderOrigin = context.RenderContext.RenderOrigin;
-        Vector3 cameraPosition = context.CameraPosition;
         return new VegetationCullingView(
-            new WorldPosition(
-                renderOrigin.X + cameraPosition.X,
-                renderOrigin.Y + cameraPosition.Y,
-                renderOrigin.Z + cameraPosition.Z),
-            renderOrigin,
+            cameraWorldPosition,
+            context.RenderContext.RenderOrigin,
             context.ViewProjection,
             camera.ProjectionType == CameraProjectionType.Perspective
                 ? VegetationCullingProjection.Perspective
@@ -533,6 +567,30 @@ internal sealed class VegetationGenericRenderPipelineFeature : IGenericRenderPip
             context.RenderContext.Height > int.MaxValue
                 ? 0
                 : (int)context.RenderContext.Height);
+    }
+
+    /// <summary>
+    /// Resolves the render camera's absolute world position, which is the anchor of the view frame
+    /// the vegetation passes render in. The cached snapshot only stores the origin-relative camera
+    /// position, so the world origin is added back in double precision.
+    /// </summary>
+    private static bool TryResolveCameraWorldPosition(
+        in GenericRenderPipelineFeatureFrameContext context,
+        out WorldPosition cameraWorldPosition)
+    {
+        if (context.Snapshot.CameraCount == 0)
+        {
+            cameraWorldPosition = default;
+            return false;
+        }
+
+        WorldPosition renderOrigin = context.RenderContext.RenderOrigin;
+        Vector3 cameraPosition = context.CameraPosition;
+        cameraWorldPosition = new WorldPosition(
+            renderOrigin.X + cameraPosition.X,
+            renderOrigin.Y + cameraPosition.Y,
+            renderOrigin.Z + cameraPosition.Z);
+        return true;
     }
 
     private static DirectionalShadowCascadeDrawRangeSet CreateEmptyShadowRanges(
@@ -595,23 +653,36 @@ internal sealed class VegetationGenericRenderPipelineFeature : IGenericRenderPip
         int shadowBatches,
         long shadowInstances)
     {
-        Guid clusterGuid = m_PreparedClusterCount == 1
-            ? m_PreparedClusters[0].Prepared.ClusterGuid
+        int loggedClusterCount = CollectLoggedClusters(out int clustersOverflow);
+        Guid clusterGuid = loggedClusterCount > 0
+            ? m_LoggedClusterGuids[0]
             : Guid.Empty;
-        Guid speciesGuid = Guid.Empty;
-        if (m_PreparedClusterCount == 1 &&
-            m_PreparedClusters[0].Prepared.Batches.Length > 0)
+        Guid speciesGuid = loggedClusterCount > 0
+            ? m_LoggedSpeciesGuids[0]
+            : Guid.Empty;
+        m_LoggedClusterList.Clear();
+        for (int index = 0; index < loggedClusterCount; index++)
         {
-            speciesGuid = m_PreparedClusters[0].Prepared.Batches[0].SpeciesGuid;
+            if (index > 0)
+            {
+                m_LoggedClusterList.Append(',');
+            }
+
+            m_LoggedClusterList
+                .Append(m_LoggedClusterGuids[index].ToString("N"))
+                .Append(':')
+                .Append(m_LoggedSpeciesGuids[index].ToString("N"))
+                .Append(':')
+                .Append(m_LoggedClusterInstances[index]);
         }
 
         KernelLog.InfoFormat(
             "[Vegetation.GenericRP.Validation] Surface=0x{0:X} Frame={1} " +
             "DeviceGeneration={2} Revision={3} PreparedClusters={4} Cluster={5:D} " +
-            "Species={6:D} OpaqueBatches={7} OpaqueInstances={8} " +
-            "RecordedShadowBatches={9} RecordedShadowInstances={10} Cascades={11} " +
-            "ShadowBatches={12},{13},{14},{15} ShadowInstances={16},{17},{18},{19} " +
-            "Dropped={20} Ticket={21}",
+            "Species={6:D} Clusters={7} ClustersOverflow={8} OpaqueBatches={9} " +
+            "OpaqueInstances={10} RecordedShadowBatches={11} RecordedShadowInstances={12} " +
+            "Cascades={13} ShadowBatches={14},{15},{16},{17} " +
+            "ShadowInstances={18},{19},{20},{21} Dropped={22} Ticket={23}",
             context.Frame.RenderContext.SurfaceId,
             context.Frame.RenderContext.FrameIndex,
             context.Frame.RenderContext.DeviceGeneration,
@@ -619,6 +690,8 @@ internal sealed class VegetationGenericRenderPipelineFeature : IGenericRenderPip
             m_PreparedClusterCount,
             clusterGuid,
             speciesGuid,
+            m_LoggedClusterList.ToString(),
+            clustersOverflow,
             opaqueBatches,
             opaqueInstances,
             shadowBatches,
@@ -634,6 +707,60 @@ internal sealed class VegetationGenericRenderPipelineFeature : IGenericRenderPip
             GetCascadeInstanceCount(3),
             m_DroppedDrawCount,
             context.SubmittedTicket);
+    }
+
+    // Validation records stay bounded and canonical: at most MaximumLoggedClusters prepared
+    // clusters are reported in ascending Guid order and every omitted cluster is counted in the
+    // overflow field, so the record never silently truncates the submitted draw set.
+    private int CollectLoggedClusters(out int clustersOverflow)
+    {
+        int loggedCount = 0;
+        int overflow = 0;
+        for (int index = 0; index < m_PreparedClusterCount; index++)
+        {
+            VegetationPreparedClusterView prepared = m_PreparedClusters[index].Prepared;
+            Guid candidateCluster = prepared.ClusterGuid;
+            Guid candidateSpecies = prepared.Batches.Length > 0
+                ? prepared.Batches[0].SpeciesGuid
+                : Guid.Empty;
+            long candidateInstances = prepared.InstanceCount;
+
+            int insertion = 0;
+            while (insertion < loggedCount &&
+                m_LoggedClusterGuids[insertion].CompareTo(candidateCluster) <= 0)
+            {
+                insertion++;
+            }
+
+            if (insertion >= MaximumLoggedClusters)
+            {
+                overflow++;
+                continue;
+            }
+
+            if (loggedCount < MaximumLoggedClusters)
+            {
+                loggedCount++;
+            }
+            else
+            {
+                overflow++;
+            }
+
+            for (int move = loggedCount - 1; move > insertion; move--)
+            {
+                m_LoggedClusterGuids[move] = m_LoggedClusterGuids[move - 1];
+                m_LoggedSpeciesGuids[move] = m_LoggedSpeciesGuids[move - 1];
+                m_LoggedClusterInstances[move] = m_LoggedClusterInstances[move - 1];
+            }
+
+            m_LoggedClusterGuids[insertion] = candidateCluster;
+            m_LoggedSpeciesGuids[insertion] = candidateSpecies;
+            m_LoggedClusterInstances[insertion] = candidateInstances;
+        }
+
+        clustersOverflow = overflow;
+        return loggedCount;
     }
 
     private int GetCascadeBatchCount(int cascadeIndex) =>
