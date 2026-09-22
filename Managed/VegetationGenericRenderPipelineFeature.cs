@@ -369,7 +369,7 @@ internal sealed class VegetationGenericRenderPipelineFeature : IGenericRenderPip
                     m_PreparedClusters,
                     0,
                     m_CullingInputCount));
-            m_DroppedDrawCount += m_CullingInputCount - m_PreparedClusterCount;
+            m_DroppedDrawCount += CountAcceptedCullingInputs() - m_PreparedClusterCount;
         }
 
         using (Profiler.Zone("Vegetation.EmitOpaqueDraws"))
@@ -646,6 +646,36 @@ internal sealed class VegetationGenericRenderPipelineFeature : IGenericRenderPip
         return true;
     }
 
+    /// <summary>
+    /// Counts the verified clusters the plan accepted, which is the only set that can become a
+    /// prepared frame. Every accepted input is prepared, so the difference between this count and
+    /// the prepared count is a dropped draw rather than a selection decision: a cluster the plan
+    /// evaluated and did not accept is culled work - it is invisible, beyond its LOD distance, or
+    /// outside the batch and instance budget - and the validation record publishes the two sets
+    /// apart so the dropped count stays a defect signal in a world that streams more than one cell.
+    /// </summary>
+    private int CountAcceptedCullingInputs()
+    {
+        ReadOnlySpan<VegetationCullingSelection> selections = new(
+            m_CullingSelections,
+            0,
+            m_CullingSelectionCount);
+        int accepted = 0;
+        for (int inputIndex = 0; inputIndex < m_CullingInputCount; inputIndex++)
+        {
+            if (VegetationClusterLookup.TryFindSelection(
+                    selections,
+                    m_CullingInputs[inputIndex].Resident.Guid,
+                    out VegetationCullingSelection selection) &&
+                selection.Accepted)
+            {
+                accepted++;
+            }
+        }
+
+        return accepted;
+    }
+
     private void LogSubmittedDrawValidation(
         in GenericRenderPipelineFeatureSubmissionContext context,
         int opaqueBatches,
@@ -678,15 +708,18 @@ internal sealed class VegetationGenericRenderPipelineFeature : IGenericRenderPip
 
         KernelLog.InfoFormat(
             "[Vegetation.GenericRP.Validation] Surface=0x{0:X} Frame={1} " +
-            "DeviceGeneration={2} Revision={3} PreparedClusters={4} Cluster={5:D} " +
-            "Species={6:D} Clusters={7} ClustersOverflow={8} OpaqueBatches={9} " +
-            "OpaqueInstances={10} RecordedShadowBatches={11} RecordedShadowInstances={12} " +
-            "Cascades={13} ShadowBatches={14},{15},{16},{17} " +
-            "ShadowInstances={18},{19},{20},{21} Dropped={22} Ticket={23}",
+            "DeviceGeneration={2} Revision={3} Extracted={4} CullingInputs={5} " +
+            "PreparedClusters={6} Cluster={7:D} Species={8:D} Clusters={9} " +
+            "ClustersOverflow={10} OpaqueBatches={11} OpaqueInstances={12} " +
+            "RecordedShadowBatches={13} RecordedShadowInstances={14} Cascades={15} " +
+            "ShadowBatches={16},{17},{18},{19} ShadowInstances={20},{21},{22},{23} " +
+            "Dropped={24} Ticket={25}",
             context.Frame.RenderContext.SurfaceId,
             context.Frame.RenderContext.FrameIndex,
             context.Frame.RenderContext.DeviceGeneration,
             m_RuntimeSnapshot.Revision,
+            m_ExtractedClusterCount,
+            m_CullingInputCount,
             m_PreparedClusterCount,
             clusterGuid,
             speciesGuid,
